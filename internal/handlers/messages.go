@@ -35,6 +35,7 @@ type MessagesHandler struct {
 	requestDedup        *middleware.RequestDeduplicator
 	requestIDGen        *middleware.RequestIDGenerator
 	metrics             *metrics.Metrics
+	autoRoute           bool
 }
 
 // responseWriter wraps http.ResponseWriter to track if headers were written.
@@ -71,6 +72,7 @@ func NewMessagesHandler(
 	fallbackHandler *router.FallbackHandler,
 	tokenCounter *token.Counter,
 	metrics *metrics.Metrics,
+	autoRoute bool,
 ) *MessagesHandler {
 	return &MessagesHandler{
 		client:              openCodeClient,
@@ -85,6 +87,7 @@ func NewMessagesHandler(
 		requestDedup:        middleware.NewRequestDeduplicator(500 * time.Millisecond),
 		requestIDGen:        middleware.NewRequestIDGenerator(),
 		metrics:             metrics,
+		autoRoute:           autoRoute,
 	}
 }
 
@@ -178,15 +181,25 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 
 	// Route to appropriate model.
 	var routeResult router.RouteResult
-	if isStreaming && !h.modelRouter.IsStreamingScenarioRoutingEnabled() {
-		// Streaming: use faster models to minimize TTFT (time-to-first-token)
-		routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
+	if h.autoRoute {
+		// Scenario-based auto-routing (long_context > complex > think > background > default)
+		if isStreaming && !h.modelRouter.IsStreamingScenarioRoutingEnabled() {
+			routeResult = h.modelRouter.RouteForStreaming(routerMessages, tokenCount)
+		} else {
+			var err error
+			routeResult, err = h.modelRouter.Route(routerMessages, tokenCount)
+			if err != nil {
+				h.sendError(w, http.StatusInternalServerError, "routing failed", err)
+				return
+			}
+		}
 	} else {
-		var err error
-		routeResult, err = h.modelRouter.Route(routerMessages, tokenCount)
-		if err != nil {
-			h.sendError(w, http.StatusInternalServerError, "routing failed", err)
-			return
+		// Direct model lookup: use the model from Claude Code's request.
+		// Looks up config.Models[modelName], falls back to passthrough if not found.
+		if isStreaming {
+			routeResult = h.modelRouter.RouteForStreamingByModel(anthropicReq.Model)
+		} else {
+			routeResult = h.modelRouter.RouteByModel(anthropicReq.Model)
 		}
 	}
 

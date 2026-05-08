@@ -20,7 +20,12 @@ Run a single test: `go test ./internal/router/ -v`
 
 **Purpose:** oc-go-cc is a proxy server that sits between Claude Code and OpenCode Go. It intercepts Anthropic API requests, transforms them to OpenAI Chat Completions format, forwards them to OpenCode Go, and transforms responses back to Anthropic SSE.
 
-**Model routing is config-driven, not code-driven.** Models are defined in `~/.config/oc-go-cc/config.json` — adding a new model does not require code changes (except for `IsAnthropicModel()` if the new model uses the Anthropic endpoint). The router in `internal/router/` selects models by matching request content against scenario patterns defined in `scenarios.go`.
+**Model routing is config-driven, not code-driven.** Models are defined in `~/.config/oc-go-cc/config.json` — adding a new model does not require code changes (except for `IsAnthropicModel()` if the new model uses the Anthropic endpoint).
+
+**Two routing modes:**
+
+- **Direct (default):** The model from Claude Code's request (e.g., `"claude-sonnet-4-6"`) is looked up in `config.Models`. If a mapping exists, that config is used. If not, the model name is passed through as-is — no mapping needed. This is the default behavior.
+- **Auto-route:** Enabled with `--auto-route` flag or `OC_GO_CC_AUTO_ROUTE=true`. The router in `internal/router/` selects models by matching request content against scenario patterns defined in `scenarios.go`.
 
 **Two API endpoints:**
 
@@ -29,7 +34,7 @@ Run a single test: `go test ./internal/router/ -v`
 
 `internal/client/opencode.go` routes by model ID via `IsAnthropicModel()`.
 
-**Scenario detection priority** (`internal/router/scenarios.go`):
+**Scenario detection priority** (`internal/router/scenarios.go`, only active with `--auto-route`):
 
 1. Long Context (>80K tokens, configurable) → MiniMax (1M context)
 2. Complex (architectural patterns, tool operations) → GLM-5.1
@@ -37,7 +42,7 @@ Run a single test: `go test ./internal/router/ -v`
 4. Background (simple read-only ops, no tools) → Qwen3.5 Plus
 5. Default → Kimi K2.6
 
-For streaming, the router downgrades to fast models (Qwen3.6 Plus) for better TTFT.
+For streaming with auto-route, the router downgrades to fast models (Qwen3.6 Plus) for better TTFT.
 
 **Polymorphic field handling:** Anthropic's `system` and `content` fields accept both strings and arrays. `pkg/types/` uses `json.RawMessage` with accessor methods (`SystemText()`, `ContentBlocks()`) to handle both formats.
 

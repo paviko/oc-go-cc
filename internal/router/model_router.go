@@ -60,6 +60,33 @@ func (r *ModelRouter) IsStreamingScenarioRoutingEnabled() bool {
 	return r.atomic.Get().EnableStreamingScenarioRouting
 }
 
+// RouteByModel looks up the incoming model name in config.Models and returns
+// the mapped config. If not found, passes the model name through as-is.
+func (r *ModelRouter) RouteByModel(modelName string) RouteResult {
+	cfg := r.atomic.Get()
+
+	primary, ok := cfg.Models[modelName]
+	if ok {
+		fallbacks := cfg.Fallbacks[modelName]
+		return RouteResult{
+			Primary:   primary,
+			Fallbacks: fallbacks,
+			Scenario:  Scenario(modelName),
+		}
+	}
+
+	// No mapping found: pass through the model name as-is.
+	return RouteResult{
+		Primary:  config.ModelConfig{ModelID: modelName},
+		Scenario: Scenario(modelName),
+	}
+}
+
+// RouteForStreamingByModel looks up a model by name for streaming requests.
+func (r *ModelRouter) RouteForStreamingByModel(modelName string) RouteResult {
+	return r.RouteByModel(modelName)
+}
+
 // GetModelChain returns the full chain of models to try (primary + fallbacks).
 func (rr *RouteResult) GetModelChain() []config.ModelConfig {
 	chain := []config.ModelConfig{rr.Primary}

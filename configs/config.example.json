@@ -6,6 +6,16 @@
   "enable_streaming_scenario_routing": false,
 
   "models": {
+    "claude-sonnet-4-6": {
+      "provider": "opencode-go",
+      "model_id": "deepseek-v4-pro",
+      "temperature": 0.1,
+      "max_tokens": 8192,
+      "reasoning_effort": "max",
+      "thinking": {
+        "type": "enabled"
+      }
+    },
     "background": {
       "provider": "opencode-go",
       "model_id": "qwen3.5-plus",

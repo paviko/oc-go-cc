@@ -109,7 +109,40 @@ kill -HUP <PID>
 
 ## Model Routing
 
-The proxy automatically detects the type of request and routes to the appropriate model based on context size and content analysis:
+### Direct Model Mapping (Default)
+
+By default, the proxy uses the model from Claude Code's request directly. It looks up the incoming model name (e.g., `"claude-sonnet-4-6"`) in `config.models` and uses the mapped config if found. If no mapping exists, the model name is passed through as-is — so you only need to add entries for models you want to remap.
+
+```json
+{
+  "models": {
+    "claude-sonnet-4-6": {
+      "provider": "opencode-go",
+      "model_id": "deepseek-v4-pro",
+      "temperature": 0.1,
+      "max_tokens": 8192,
+      "reasoning_effort": "max",
+      "thinking": { "type": "enabled" }
+    },
+    "claude-opus-4-7": {
+      "provider": "opencode-go",
+      "model_id": "deepseek-v4-pro",
+      "temperature": 0.1,
+      "max_tokens": 16384,
+      "reasoning_effort": "max",
+      "thinking": { "type": "enabled" }
+    }
+  }
+}
+```
+
+With this config, `claude-sonnet-4-6` and `claude-opus-4-7` both map to DeepSeek V4 Pro. Any other model (e.g., `claude-haiku-4-5`) would pass through as-is if no mapping is configured.
+
+If you don't configure any model-name entries at all, every model passes through unchanged — the proxy just transforms the format.
+
+### Auto-Route (Opt-in)
+
+Enable scenario-based auto-routing with `--auto-route` or `OC_GO_CC_AUTO_ROUTE=true`. When enabled, the proxy automatically detects the type of request and routes to the appropriate model based on context size and content analysis:
 
 | Scenario         | Trigger                                             | Model        | Why                                             |
 | ---------------- | --------------------------------------------------- | ------------ | ----------------------------------------------- |

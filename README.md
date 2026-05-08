@@ -11,7 +11,7 @@ OpenCode Go gives you access to powerful open coding models for **$5/month** (th
 ## Features
 
 - **Transparent Proxy** — Claude Code sends Anthropic-format requests, proxy transforms to OpenAI format and back
-- **Model Routing** — Automatically routes to different models based on context (default, thinking, long context, background)
+- **Model Routing** — Direct model mapping (passthrough or config-driven) by default. Opt-in scenario-based auto-routing with `--auto-route`
 - **Fallback Chains** — If a model fails, automatically tries the next one in your configured chain
 - **Circuit Breaker** — Tracks model health and skips failing models to avoid latency spikes
 - **Real-time Streaming** — Full SSE streaming with live OpenAI -> Anthropic format transformation
@@ -73,6 +73,7 @@ claude
 oc-go-cc serve              Start the proxy server
 oc-go-cc serve -b           Start in background (detached from terminal)
 oc-go-cc serve --port 8080  Start on a custom port
+oc-go-cc serve --auto-route Enable scenario-based auto-routing
 oc-go-cc stop               Stop the running proxy server
 oc-go-cc status             Check if the proxy is running
 oc-go-cc init               Create default configuration file

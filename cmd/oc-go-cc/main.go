@@ -53,6 +53,7 @@ func serveCmd() *cobra.Command {
 	var configPath string
 	var port int
 	var background bool
+	var autoRoute bool
 	var daemonize bool // hidden internal flag
 
 	cmd := &cobra.Command{
@@ -64,6 +65,7 @@ func serveCmd() *cobra.Command {
 				opts := daemon.BackgroundOpts{
 					ConfigPath: configPath,
 					Port:       port,
+					AutoRoute:  autoRoute,
 				}
 				return daemon.ForkIntoBackground(opts)
 			}
@@ -71,6 +73,11 @@ func serveCmd() *cobra.Command {
 			// Override config path if provided.
 			if configPath != "" {
 				_ = os.Setenv("OC_GO_CC_CONFIG", configPath)
+			}
+
+			// Check env var fallback for auto-route.
+			if !autoRoute && os.Getenv("OC_GO_CC_AUTO_ROUTE") == "true" {
+				autoRoute = true
 			}
 
 			cfg, err := config.Load()
@@ -128,7 +135,7 @@ func serveCmd() *cobra.Command {
 			}
 
 			// Create and start server.
-			srv, err := server.NewServer(atomicCfg)
+			srv, err := server.NewServer(atomicCfg, autoRoute)
 			if err != nil {
 				return fmt.Errorf("failed to create server: %w", err)
 			}
@@ -160,6 +167,7 @@ func serveCmd() *cobra.Command {
 	cmd.Flags().StringVarP(&configPath, "config", "c", "", "Path to config file")
 	cmd.Flags().IntVarP(&port, "port", "p", 0, "Override listen port")
 	cmd.Flags().BoolVarP(&background, "background", "b", false, "Run as background daemon")
+	cmd.Flags().BoolVar(&autoRoute, "auto-route", false, "Enable scenario-based auto-routing for model selection")
 	cmd.Flags().BoolVar(&daemonize, "_daemonize", false, "Internal use only")
 	_ = cmd.Flags().MarkHidden("_daemonize")
 
@@ -386,6 +394,16 @@ func getDefaultConfig() string {
   "hot_reload": false,
   "enable_streaming_scenario_routing": false,
   "models": {
+    "claude-sonnet-4-6": {
+      "provider": "opencode-go",
+      "model_id": "deepseek-v4-pro",
+      "temperature": 0.1,
+      "max_tokens": 8192,
+      "reasoning_effort": "max",
+      "thinking": {
+        "type": "enabled"
+      }
+    },
     "background": {
       "provider": "opencode-go",
       "model_id": "qwen3.5-plus",

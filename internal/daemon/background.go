@@ -12,6 +12,7 @@ import (
 type BackgroundOpts struct {
 	ConfigPath string // --config flag value, may be empty
 	Port       int    // --port flag value, 0 means default
+	AutoRoute  bool   // --auto-route flag value
 }
 
 // ForkIntoBackground starts the current binary as a detached background process.
@@ -30,7 +31,7 @@ func ForkIntoBackground(opts BackgroundOpts) error {
 		_ = os.Remove(paths.PIDFile)
 	}
 
-	// Build args for the child process: oc-go-cc serve --_daemonize [--config X] [--port N]
+	// Build args for the child process: oc-go-cc serve --_daemonize [--config X] [--port N] [--auto-route]
 	args := []string{"serve", "--_daemonize"}
 	if opts.ConfigPath != "" {
 		configPath, err := filepath.Abs(opts.ConfigPath)
@@ -41,6 +42,9 @@ func ForkIntoBackground(opts BackgroundOpts) error {
 	}
 	if opts.Port != 0 {
 		args = append(args, "--port", strconv.Itoa(opts.Port))
+	}
+	if opts.AutoRoute {
+		args = append(args, "--auto-route")
 	}
 
 	// Open log file for the background process

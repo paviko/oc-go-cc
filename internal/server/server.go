@@ -28,7 +28,7 @@ type Server struct {
 }
 
 // NewServer creates a new proxy server.
-func NewServer(atomic *config.AtomicConfig) (*Server, error) {
+func NewServer(atomic *config.AtomicConfig, autoRoute bool) (*Server, error) {
 	cfg := atomic.Get()
 	levelVar := new(slog.LevelVar)
 	levelVar.Set(parseLogLevel(cfg.Logging.Level))
@@ -58,6 +58,7 @@ func NewServer(atomic *config.AtomicConfig) (*Server, error) {
 		fallbackHandler,
 		tokenCounter,
 		metrics,
+		autoRoute,
 	)
 	healthHandler := handlers.NewHealthHandler(tokenCounter, fallbackHandler, metrics)
 

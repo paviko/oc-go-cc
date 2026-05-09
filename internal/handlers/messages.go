@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,6 +23,63 @@ import (
 	"oc-go-cc/internal/transformer"
 	"oc-go-cc/pkg/types"
 )
+
+// streamResponseCache caches Anthropic-format responses from streaming requests
+// so that subsequent non-streaming duplicates can be served from cache.
+type streamResponseCache struct {
+	mu       sync.Mutex
+	entries  map[string]*cacheEntry
+}
+
+type cacheEntry struct {
+	response []byte
+	done     chan struct{}
+}
+
+func newStreamResponseCache() *streamResponseCache {
+	return &streamResponseCache{
+		entries: make(map[string]*cacheEntry),
+	}
+}
+
+// getOrCreate returns an existing cache entry or creates a new one.
+// If the entry already exists and is complete, returns (response, true, true).
+// If the entry is still pending, waits for it and returns (response, true, false).
+// If no entry exists, creates one and returns (nil, false, false).
+func (c *streamResponseCache) getOrCreate(key string) ([]byte, bool) {
+	c.mu.Lock()
+	entry, exists := c.entries[key]
+	if exists {
+		c.mu.Unlock()
+		<-entry.done
+		return entry.response, true
+	}
+	entry = &cacheEntry{done: make(chan struct{})}
+	c.entries[key] = entry
+	c.mu.Unlock()
+	return nil, false
+}
+
+// store stores a response and signals waiters. The entry is removed after ttl.
+func (c *streamResponseCache) store(key string, response []byte, ttl time.Duration) {
+	c.mu.Lock()
+	entry, exists := c.entries[key]
+	if !exists {
+		c.mu.Unlock()
+		return
+	}
+	entry.response = response
+	close(entry.done)
+
+	// Schedule cleanup after ttl
+	go func() {
+		time.Sleep(ttl)
+		c.mu.Lock()
+		delete(c.entries, key)
+		c.mu.Unlock()
+	}()
+	c.mu.Unlock()
+}
 
 // MessagesHandler handles /v1/messages requests.
 type MessagesHandler struct {
@@ -40,6 +98,7 @@ type MessagesHandler struct {
 	autoRoute           bool
 	requestLogger       *RequestLogger
 	requestCounter      atomic.Int64
+	responseCache       *streamResponseCache
 }
 
 // responseWriter wraps http.ResponseWriter to track if headers were written.
@@ -99,6 +158,7 @@ func NewMessagesHandler(
 		metrics:             metrics,
 		autoRoute:           autoRoute,
 		requestLogger:       requestLogger,
+		responseCache:       newStreamResponseCache(),
 	}
 }
 
@@ -227,13 +287,215 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	modelChain := routeResult.GetModelChain()
 	primaryModel := modelChain[0].ModelID
 
+	// Compute cache key from rawBody with stream field stripped.
+	// This groups streaming and non-streaming duplicates of the same request.
+	cacheKey := normalizeForCache(rawBody)
+
+	// Log the Anthropic request body and normalized cache key for debugging.
+	h.requestLogger.Log(reqNum, isStreaming, primaryModel, rawBody, "anthropic_req")
+	h.requestLogger.Log(reqNum, isStreaming, primaryModel, []byte(cacheKey), "cache_key")
+
+	// Create or get the cache entry BEFORE processing either path.
+	// This ensures that a streaming request creates the entry (so store() can
+	// find it later) and a non-streaming request that arrives after streaming
+	// completes will hit the cache.
+	if cached, ok := h.responseCache.getOrCreate(cacheKey); ok {
+		// Cache hit -- the streaming response was already cached.
+		h.logger.Info("serving request from streaming cache")
+		if isStreaming {
+			// Replay the cached response as SSE (unlikely but handle it).
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(cached)
+		} else {
+			h.requestLogger.Log(reqNum, false, primaryModel, cached, "transformed")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(cached)
+		}
+		return
+	}
+
 	if isStreaming {
 		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel)
+		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel, cacheKey)
 	} else {
 		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel)
+		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel, cacheKey)
 	}
+}
+
+// normalizeForCache strips fields that differ between streaming and non-streaming
+// variants of the same request (the "stream" flag and the billing header cch value),
+// so they produce the same cache key.
+func normalizeForCache(rawBody json.RawMessage) string {
+	var m map[string]any
+	if err := json.Unmarshal(rawBody, &m); err != nil {
+		return string(rawBody)
+	}
+	delete(m, "stream")
+
+	// Strip the billing-header cch value from the system prompt.
+	// CC embeds "x-anthropic-billing-header: ...; cch=XXXXX;" at the start
+	// of the system string, and the cch value changes between requests,
+	// preventing cache hits. We strip the cch=<hex> part.
+	if sys, ok := m["system"]; ok {
+		m["system"] = stripBillingCCH(sys)
+	}
+
+	normalized, _ := json.Marshal(m)
+	return string(normalized)
+}
+
+
+func stripBillingCCH(sys any) any {
+	switch v := sys.(type) {
+	case string:
+		// Remove "; cch=XXXXX" from the billing header prefix.
+		// Format: "...; cch=HEX;You are Claude..."
+		cchIdx := strings.Index(v, "; cch=")
+		if cchIdx == -1 {
+			return v
+		}
+		// Skip past "; cch=" to find the hex value
+		rest := v[cchIdx+len("; cch="):]
+		hexEnd := 0
+		for hexEnd < len(rest) && (rest[hexEnd] >= '0' && rest[hexEnd] <= '9' ||
+			rest[hexEnd] >= 'a' && rest[hexEnd] <= 'f') {
+			hexEnd++
+		}
+		return v[:cchIdx] + rest[hexEnd:]
+	case []any:
+		result := make([]any, len(v))
+		for i, item := range v {
+			result[i] = stripBillingCCH(item)
+		}
+		return result
+	case map[string]any:
+		result := make(map[string]any, len(v))
+		for k, val := range v {
+			result[k] = stripBillingCCH(val)
+		}
+		return result
+	}
+	return sys
+}
+
+// parseSSEToMessageResponse extracts a non-streaming MessageResponse from the
+// buffered Anthropic SSE stream captured during streaming.
+func parseSSEToMessageResponse(sseData []byte) *types.MessageResponse {
+	var resp types.MessageResponse
+	var contentBlocks []types.ContentBlock
+	var currentText string
+	var currentToolUse *types.ContentBlock
+	var currentThinking string
+	currentBlockIndex := -1
+
+	lines := strings.Split(string(sseData), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, ":") {
+			// Skip empty lines and SSE comments (keepalives)
+			continue
+		}
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+
+		var event types.MessageEvent
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+
+		switch event.Type {
+		case "message_start":
+			if event.Message != nil {
+				resp.ID = event.Message.ID
+				resp.Model = event.Message.Model
+				resp.Type = "message"
+				resp.Role = "assistant"
+			}
+		case "content_block_start":
+			if event.ContentBlock != nil {
+				currentBlockIndex = *event.Index
+				cb := *event.ContentBlock
+				switch cb.Type {
+				case "text":
+					currentText = ""
+				case "thinking":
+					currentThinking = ""
+				case "tool_use":
+					tc := cb
+					currentToolUse = &tc
+				}
+			}
+		case "content_block_delta":
+			if event.Delta != nil {
+				switch event.Delta.Type {
+				case "text_delta":
+					currentText += event.Delta.Text
+				case "thinking_delta":
+					currentThinking += event.Delta.Thinking
+				case "input_json_delta":
+					if currentToolUse != nil {
+						currentToolUse.Input = append(currentToolUse.Input, []byte(event.Delta.PartialJSON)...)
+					}
+				}
+			}
+		case "content_block_stop":
+			var cb types.ContentBlock
+			if currentToolUse != nil {
+				cb = *currentToolUse
+				currentToolUse = nil
+			} else if currentThinking != "" {
+				cb = types.ContentBlock{Type: "thinking", Thinking: currentThinking}
+				currentThinking = ""
+			} else {
+				cb = types.ContentBlock{Type: "text", Text: currentText}
+				currentText = ""
+			}
+			contentBlocks = append(contentBlocks, cb)
+			_ = currentBlockIndex
+		case "message_delta":
+			if event.Delta != nil && event.Delta.StopReason != "" {
+				resp.StopReason = event.Delta.StopReason
+			}
+			if event.Usage != nil {
+				resp.Usage = types.Usage{
+					InputTokens:              event.Usage.InputTokens,
+					OutputTokens:             event.Usage.OutputTokens,
+					CacheCreationInputTokens: event.Usage.CacheCreationInputTokens,
+					CacheReadInputTokens:     event.Usage.CacheReadInputTokens,
+				}
+			}
+		case "message_stop":
+			// If we have an open text/thinking block that wasn't closed,
+			// include it in the response.
+			if currentText != "" {
+				contentBlocks = append(contentBlocks, types.ContentBlock{Type: "text", Text: currentText})
+				currentText = ""
+			}
+			if currentThinking != "" {
+				contentBlocks = append(contentBlocks, types.ContentBlock{Type: "thinking", Thinking: currentThinking})
+				currentThinking = ""
+			}
+			if currentToolUse != nil {
+				contentBlocks = append(contentBlocks, *currentToolUse)
+				currentToolUse = nil
+			}
+		}
+	}
+
+	resp.Content = contentBlocks
+	if resp.ID == "" {
+		return nil
+	}
+	return &resp
 }
 
 // handleStreaming handles a streaming request with real-time SSE proxying.
@@ -245,6 +507,7 @@ func (h *MessagesHandler) handleStreaming(
 	rawBody json.RawMessage,
 	reqNum int,
 	primaryModel string,
+	cacheKey string,
 ) {
 	// Each fallback attempt needs its own context with timeout.
 	// Don't share r.Context() across fallbacks - when Claude Code retries,
@@ -325,6 +588,11 @@ func (h *MessagesHandler) handleStreaming(
 			}
 			cancel()
 			h.requestLogger.Log(reqNum, true, primaryModel, streamBuf.Bytes(), "resp")
+			if cached := parseSSEToMessageResponse(streamBuf.Bytes()); cached != nil {
+				if cachedJSON, err := json.Marshal(cached); err == nil {
+					h.responseCache.store(cacheKey, cachedJSON, 5*time.Second)
+				}
+			}
 			latency := time.Since(streamStart)
 			h.metrics.RecordSuccess(model.ModelID, latency)
 			h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
@@ -377,6 +645,11 @@ func (h *MessagesHandler) handleStreaming(
 		_ = streamBody.Close()
 		cancel()
 		h.requestLogger.Log(reqNum, true, primaryModel, streamBuf.Bytes(), "resp")
+		if cached := parseSSEToMessageResponse(streamBuf.Bytes()); cached != nil {
+			if cachedJSON, err := json.Marshal(cached); err == nil {
+				h.responseCache.store(cacheKey, cachedJSON, 5*time.Second)
+			}
+		}
 		latency := time.Since(streamStart)
 		h.metrics.RecordSuccess(model.ModelID, latency)
 		h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
@@ -486,6 +759,7 @@ func (h *MessagesHandler) handleNonStreaming(
 	rawBody json.RawMessage,
 	reqNum int,
 	primaryModel string,
+	cacheKey string,
 ) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -517,6 +791,9 @@ func (h *MessagesHandler) handleNonStreaming(
 		"attempts", result.Attempted,
 		"latency", latency,
 	)
+
+	// Cache the response so subsequent non-streaming duplicates can reuse it.
+	h.responseCache.store(cacheKey, responseBody, 5*time.Second)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

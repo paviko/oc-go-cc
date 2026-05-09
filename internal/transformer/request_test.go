@@ -316,12 +316,11 @@ func TestTransformRequestAppliesReasoningEffortAndThinking(t *testing.T) {
 	}
 }
 
-func TestTransformRequestStripsReasoningEffortWhenNoThinkingHistory(t *testing.T) {
+func TestTransformRequestForwardsReasoningEffortWhenNoThinkingHistory(t *testing.T) {
 	transformer := NewRequestTransformer()
 
-	// When the conversation history has NO thinking blocks, reasoning_effort
-	// and thinking should be stripped to avoid DeepSeek's validation error:
-	// "The reasoning_content in the thinking mode must be passed back to the API."
+	// When config defines reasoning_effort, it is always forwarded regardless
+	// of thinking history. Config thinking is also forwarded.
 	req := &types.MessageRequest{
 		Model:     "claude-test",
 		MaxTokens: 256,
@@ -340,12 +339,13 @@ func TestTransformRequestStripsReasoningEffortWhenNoThinkingHistory(t *testing.T
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
 
-	if openaiReq.ReasoningEffort != nil {
-		t.Fatalf("ReasoningEffort = %v, want nil (stripped because no thinking history)", *openaiReq.ReasoningEffort)
+	if openaiReq.ReasoningEffort == nil {
+		t.Fatal("ReasoningEffort = nil, want max (config always forwarded)")
 	}
-	// We explicitly send thinking: {"type":"disabled"} so DeepSeek knows
-	// not to require reasoning_content on assistant messages.
-	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
+	if got, want := *openaiReq.ReasoningEffort, "max"; got != want {
+		t.Fatalf("ReasoningEffort = %q, want %q", got, want)
+	}
+	if got, want := string(openaiReq.Thinking), `{"type":"enabled"}`; got != want {
 		t.Fatalf("Thinking = %s, want %s", got, want)
 	}
 }
@@ -467,11 +467,11 @@ func TestTransformRequestPlacesToolResultsBeforeUserText(t *testing.T) {
 	}
 }
 
-func TestTransformRequestSkipsReasoningEffortWhenThinkingDisabled(t *testing.T) {
+func TestTransformRequestForwardsReasoningEffortEvenWhenThinkingDisabled(t *testing.T) {
 	transformer := NewRequestTransformer()
 
-	// When thinking is explicitly disabled in model config, reasoning_effort
-	// must NOT be set — DeepSeek returns 400 if both are present.
+	// reasoning_effort is always forwarded when config defines it, even when
+	// thinking is disabled in config.
 	req := &types.MessageRequest{
 		Model:     "claude-test",
 		MaxTokens: 256,
@@ -496,8 +496,11 @@ func TestTransformRequestSkipsReasoningEffortWhenThinkingDisabled(t *testing.T) 
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
 
-	if openaiReq.ReasoningEffort != nil {
-		t.Fatalf("ReasoningEffort = %v, want nil (stripped because thinking is disabled)", *openaiReq.ReasoningEffort)
+	if openaiReq.ReasoningEffort == nil {
+		t.Fatal("ReasoningEffort = nil, want max (config always forwarded)")
+	}
+	if got, want := *openaiReq.ReasoningEffort, "max"; got != want {
+		t.Fatalf("ReasoningEffort = %q, want %q", got, want)
 	}
 	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
 		t.Fatalf("Thinking = %s, want %s", got, want)
@@ -587,6 +590,133 @@ func TestTransformRequestDeepSeekPlaceholderWithThinkingHistory(t *testing.T) {
 	}
 	if *toolCallAssistant.ReasoningContent != " " {
 		t.Fatalf("ReasoningContent = %q, want placeholder space", *toolCallAssistant.ReasoningContent)
+	}
+}
+
+func TestAnthropicThinkingToReasoningEffort(t *testing.T) {
+	tests := []struct {
+		name     string
+		thinking string
+		want     string
+	}{
+		{"empty", "", ""},
+		{"disabled", `{"type":"disabled","budget_tokens":1000}`, ""},
+		{"max budget", `{"type":"enabled","budget_tokens":64000}`, "max"},
+		{"max budget boundary", `{"type":"enabled","budget_tokens":128000}`, "max"},
+		{"xhigh budget", `{"type":"enabled","budget_tokens":32000}`, "xhigh"},
+		{"xhigh budget boundary", `{"type":"enabled","budget_tokens":48000}`, "xhigh"},
+		{"high budget", `{"type":"enabled","budget_tokens":16000}`, "high"},
+		{"high budget boundary", `{"type":"enabled","budget_tokens":24000}`, "high"},
+		{"medium budget", `{"type":"enabled","budget_tokens":8000}`, "medium"},
+		{"medium budget boundary", `{"type":"enabled","budget_tokens":4000}`, "medium"},
+		{"low budget", `{"type":"enabled","budget_tokens":2000}`, "low"},
+		{"low budget boundary", `{"type":"enabled","budget_tokens":1}`, "low"},
+		{"enabled no budget", `{"type":"enabled"}`, "low"},
+		{"invalid json", `not json`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := anthropicThinkingToReasoningEffort(json.RawMessage(tt.thinking))
+			if got != tt.want {
+				t.Errorf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAnthropicThinkingToOpenAIThinking(t *testing.T) {
+	tests := []struct {
+		name     string
+		thinking string
+		want     string
+	}{
+		{"empty", "", ""},
+		{"disabled", `{"type":"disabled","budget_tokens":1000}`, `{"type":"disabled"}`},
+		{"enabled", `{"type":"enabled","budget_tokens":32000}`, `{"type":"enabled"}`},
+		{"enabled no budget", `{"type":"enabled"}`, `{"type":"enabled"}`},
+		{"invalid json", `not json`, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := anthropicThinkingToOpenAIThinking(json.RawMessage(tt.thinking))
+			if tt.want == "" {
+				if got != nil {
+					t.Errorf("got %s, want nil", string(got))
+				}
+			} else {
+				if got == nil {
+					t.Fatal("got nil, want non-nil")
+				}
+				if string(got) != tt.want {
+					t.Errorf("got %s, want %s", string(got), tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestTransformRequestDerivesReasoningEffortFromAnthropicThinking(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// When model config has no reasoning_effort but the Anthropic request has
+	// thinking with budget_tokens, reasoning_effort should be derived.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Thinking:  json.RawMessage(`{"type":"enabled","budget_tokens":32000}`),
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "kimi-k2.6",
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if openaiReq.ReasoningEffort == nil {
+		t.Fatal("ReasoningEffort = nil, want xhigh (derived from budget_tokens=32000)")
+	}
+	if got, want := *openaiReq.ReasoningEffort, "xhigh"; got != want {
+		t.Fatalf("ReasoningEffort = %q, want %q", got, want)
+	}
+	// No thinking history, no config thinking — thinking should be set from Anthropic request
+	if openaiReq.Thinking == nil {
+		t.Fatal("Thinking = nil, want enabled (derived from Anthropic request)")
+	}
+	if got, want := string(openaiReq.Thinking), `{"type":"enabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want %s", got, want)
+	}
+}
+
+func TestTransformRequestConfigReasoningEffortOverridesAnthropicThinking(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// Config reasoning_effort takes precedence over Anthropic thinking derivation.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Thinking:  json.RawMessage(`{"type":"enabled","budget_tokens":32000}`),
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:         "kimi-k2.6",
+		ReasoningEffort: "medium",
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if openaiReq.ReasoningEffort == nil {
+		t.Fatal("ReasoningEffort = nil, want medium")
+	}
+	if got, want := *openaiReq.ReasoningEffort, "medium"; got != want {
+		t.Fatalf("ReasoningEffort = %q, want %q", got, want)
 	}
 }
 

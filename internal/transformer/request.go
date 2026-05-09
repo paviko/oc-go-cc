@@ -19,14 +19,59 @@ func NewRequestTransformer() *RequestTransformer {
 	return &RequestTransformer{}
 }
 
-// isThinkingDisabled checks if the thinking JSON config explicitly sets type to "disabled".
-func isThinkingDisabled(thinking json.RawMessage) bool {
-	var m map[string]interface{}
-	if err := json.Unmarshal(thinking, &m); err != nil {
-		return false
+// anthropicThinkingToReasoningEffort maps Anthropic's thinking config (which uses
+// budget_tokens) to an OpenAI reasoning_effort value.
+// Returns empty string if thinking is disabled or absent.
+func anthropicThinkingToReasoningEffort(thinking json.RawMessage) string {
+	if len(thinking) == 0 {
+		return ""
 	}
-	t, ok := m["type"].(string)
-	return ok && t == "disabled"
+	var m struct {
+		Type         string `json:"type"`
+		BudgetTokens *int   `json:"budget_tokens"`
+	}
+	if err := json.Unmarshal(thinking, &m); err != nil {
+		return ""
+	}
+	if m.Type == "disabled" {
+		return ""
+	}
+	if m.BudgetTokens != nil {
+		switch {
+		case *m.BudgetTokens >= 64000:
+			return "max"
+		case *m.BudgetTokens >= 32000:
+			return "xhigh"
+		case *m.BudgetTokens >= 16000:
+			return "high"
+		case *m.BudgetTokens >= 4000:
+			return "medium"
+		default:
+			return "low"
+		}
+	}
+	if m.Type == "enabled" {
+		return "low"
+	}
+	return ""
+}
+
+// anthropicThinkingToOpenAIThinking maps Anthropic's thinking config to the
+// OpenAI/DeepSeek thinking format ({"type":"enabled"} or {"type":"disabled"}).
+func anthropicThinkingToOpenAIThinking(thinking json.RawMessage) json.RawMessage {
+	if len(thinking) == 0 {
+		return nil
+	}
+	var m struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(thinking, &m); err != nil {
+		return nil
+	}
+	if m.Type == "disabled" {
+		return json.RawMessage(`{"type":"disabled"}`)
+	}
+	return json.RawMessage(`{"type":"enabled"}`)
 }
 
 // isDeepSeekModel returns true for DeepSeek models that require thinking mode handling.
@@ -85,34 +130,25 @@ func (t *RequestTransformer) TransformRequest(
 		openaiReq.MaxTokens = &maxTokens
 	}
 
-	// DeepSeek-v4 models always operate in thinking mode. When conversation
-	// history contains thinking blocks (round-tripped as reasoning_content),
-	// we MUST send thinking mode params so DeepSeek validates reasoning_content
-	// on assistant messages. When history LACKS thinking blocks (Claude Code
-	// dropped them), we MUST explicitly disable thinking mode so DeepSeek
-	// doesn't require reasoning_content we can't provide.
+	// reasoning_effort: config takes priority, then derive from incoming Anthropic thinking.
+	if model.ReasoningEffort != "" {
+		openaiReq.ReasoningEffort = &model.ReasoningEffort
+	} else if effort := anthropicThinkingToReasoningEffort(anthropicReq.Thinking); effort != "" {
+		openaiReq.ReasoningEffort = &effort
+	}
+
+	// thinking (DeepSeek format): config takes priority, then derive from Anthropic thinking.
 	hasThinkingInHistory := HasThinkingBlocks(anthropicReq.Messages)
-	if hasThinkingInHistory {
-		if len(model.Thinking) > 0 {
-			openaiReq.Thinking = model.Thinking
+	if len(model.Thinking) > 0 {
+		openaiReq.Thinking = model.Thinking
+	} else if hasThinkingInHistory {
+		if len(anthropicReq.Thinking) > 0 {
+			openaiReq.Thinking = anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
 		} else {
 			openaiReq.Thinking = json.RawMessage(`{"type":"enabled"}`)
 		}
-		// DeepSeek returns 400 if reasoning_effort is sent alongside
-		// thinking: disabled — only set it when thinking is active.
-		if !isThinkingDisabled(openaiReq.Thinking) || !isDeepSeekModel(model.ModelID) {
-			if model.ReasoningEffort != "" {
-				openaiReq.ReasoningEffort = &model.ReasoningEffort
-			} else {
-				defaultEffort := "high"
-				openaiReq.ReasoningEffort = &defaultEffort
-			}
-		}
-	} else if len(model.Thinking) > 0 || model.ReasoningEffort != "" {
-		// Model config wants thinking mode but history has no thinking blocks.
-		// Explicitly disable to prevent DeepSeek from requiring reasoning_content
-		// on assistant messages that can't provide it.
-		openaiReq.Thinking = json.RawMessage(`{"type":"disabled"}`)
+	} else if len(anthropicReq.Thinking) > 0 {
+		openaiReq.Thinking = anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
 	}
 
 	// Transform tools if present

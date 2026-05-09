@@ -99,6 +99,7 @@ type MessagesHandler struct {
 	requestLogger       *RequestLogger
 	requestCounter      atomic.Int64
 	responseCache       *streamResponseCache
+	timeout             time.Duration
 }
 
 // responseWriter wraps http.ResponseWriter to track if headers were written.
@@ -142,7 +143,13 @@ func NewMessagesHandler(
 	metrics *metrics.Metrics,
 	autoRoute bool,
 	requestLogger *RequestLogger,
+	atomic *config.AtomicConfig,
 ) *MessagesHandler {
+	cfg := atomic.Get()
+	timeout := time.Duration(cfg.OpenCodeGo.TimeoutMs) * time.Millisecond
+	if timeout == 0 {
+		timeout = 5 * time.Minute
+	}
 	return &MessagesHandler{
 		client:              openCodeClient,
 		modelRouter:         modelRouter,
@@ -159,6 +166,7 @@ func NewMessagesHandler(
 		autoRoute:           autoRoute,
 		requestLogger:       requestLogger,
 		responseCache:       newStreamResponseCache(),
+		timeout:             timeout,
 	}
 }
 
@@ -569,7 +577,7 @@ func (h *MessagesHandler) handleStreaming(
 
 		// Create a fresh context with timeout for THIS attempt only.
 		// Don't use r.Context() directly - it gets canceled when Claude Code retries.
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		ctx, cancel := context.WithTimeout(context.Background(), h.timeout)
 
 		// Check if this is an Anthropic-native model (MiniMax)
 		if client.IsAnthropicModel(model.ModelID) {

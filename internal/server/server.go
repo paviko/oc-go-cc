@@ -68,6 +68,7 @@ func NewServer(atomic *config.AtomicConfig, autoRoute bool) (*Server, error) {
 		metrics,
 		autoRoute,
 		requestLogger,
+		atomic,
 	)
 	healthHandler := handlers.NewHealthHandler(tokenCounter, fallbackHandler, metrics)
 

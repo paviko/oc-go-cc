@@ -52,6 +52,14 @@ func NewServer(atomic *config.AtomicConfig, autoRoute bool) (*Server, error) {
 	fallbackHandler := router.NewFallbackHandler(logger, 3, 30*time.Second)
 
 	// Create handlers.
+	var requestLogger *handlers.RequestLogger
+	if cfg.Logging.Level == "debug" {
+		requestLogger = handlers.NewRequestLogger()
+		if requestLogger != nil {
+			logger.Info("request body logging enabled", "dir", "~/.config/oc-go-cc/logs/")
+		}
+	}
+
 	messagesHandler := handlers.NewMessagesHandler(
 		openCodeClient,
 		modelRouter,
@@ -59,6 +67,7 @@ func NewServer(atomic *config.AtomicConfig, autoRoute bool) (*Server, error) {
 		tokenCounter,
 		metrics,
 		autoRoute,
+		requestLogger,
 	)
 	healthHandler := handlers.NewHealthHandler(tokenCounter, fallbackHandler, metrics)
 

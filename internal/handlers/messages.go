@@ -2,6 +2,7 @@
 package handlers
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"oc-go-cc/internal/client"
@@ -36,12 +38,15 @@ type MessagesHandler struct {
 	requestIDGen        *middleware.RequestIDGenerator
 	metrics             *metrics.Metrics
 	autoRoute           bool
+	requestLogger       *RequestLogger
+	requestCounter      atomic.Int64
 }
 
 // responseWriter wraps http.ResponseWriter to track if headers were written.
 type responseWriter struct {
 	http.ResponseWriter
 	wroteHeader bool
+	tee         io.Writer // if set, Write also copies to this writer
 }
 
 func (w *responseWriter) WriteHeader(code int) {
@@ -54,6 +59,10 @@ func (w *responseWriter) WriteHeader(code int) {
 func (w *responseWriter) Write(b []byte) (int, error) {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
+	}
+	if w.tee != nil {
+		n, _ := w.tee.Write(b)
+		slog.Debug("responseWriter tee write", "written", n, "total", len(b))
 	}
 	return w.ResponseWriter.Write(b)
 }
@@ -73,6 +82,7 @@ func NewMessagesHandler(
 	tokenCounter *token.Counter,
 	metrics *metrics.Metrics,
 	autoRoute bool,
+	requestLogger *RequestLogger,
 ) *MessagesHandler {
 	return &MessagesHandler{
 		client:              openCodeClient,
@@ -88,6 +98,7 @@ func NewMessagesHandler(
 		requestIDGen:        middleware.NewRequestIDGenerator(),
 		metrics:             metrics,
 		autoRoute:           autoRoute,
+		requestLogger:       requestLogger,
 	}
 }
 
@@ -144,6 +155,9 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 	// Record metrics
 	isStreaming := anthropicReq.Stream != nil && *anthropicReq.Stream
 	h.metrics.RecordRequest(isStreaming)
+
+	// Increment request counter for file logging
+	reqNum := int(h.requestCounter.Add(1))
 
 	h.logger.Info("received request",
 		"model", anthropicReq.Model,
@@ -211,13 +225,14 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 
 	// Build fallback chain.
 	modelChain := routeResult.GetModelChain()
+	primaryModel := modelChain[0].ModelID
 
 	if isStreaming {
 		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel)
 	} else {
 		// Non-streaming: execute with fallback and return full response
-		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody)
+		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel)
 	}
 }
 
@@ -228,13 +243,16 @@ func (h *MessagesHandler) handleStreaming(
 	anthropicReq *types.MessageRequest,
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
+	reqNum int,
+	primaryModel string,
 ) {
 	// Each fallback attempt needs its own context with timeout.
 	// Don't share r.Context() across fallbacks - when Claude Code retries,
 	// the original context gets canceled and kills all fallbacks.
 	clientCtx := r.Context()
 
-	rw := &responseWriter{ResponseWriter: w}
+	var streamBuf bytes.Buffer
+	rw := &responseWriter{ResponseWriter: w, tee: &streamBuf}
 
 	// Set SSE headers immediately so Claude Code knows the stream is alive.
 	// This prevents client-side timeouts before we even start sending data.
@@ -306,6 +324,7 @@ func (h *MessagesHandler) handleStreaming(
 				continue
 			}
 			cancel()
+			h.requestLogger.Log(reqNum, true, primaryModel, streamBuf.Bytes(), "resp")
 			latency := time.Since(streamStart)
 			h.metrics.RecordSuccess(model.ModelID, latency)
 			h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
@@ -318,6 +337,11 @@ func (h *MessagesHandler) handleStreaming(
 			cancel()
 			h.logger.Warn("request transform failed", "model", model.ModelID, "error", err)
 			continue
+		}
+
+		// Write outgoing OpenAI streaming request body to file
+		if reqJSON, err := json.Marshal(openaiReq); err == nil {
+			h.requestLogger.Log(reqNum, true, primaryModel, reqJSON, "req")
 		}
 
 		// Get streaming body from upstream
@@ -352,6 +376,7 @@ func (h *MessagesHandler) handleStreaming(
 
 		_ = streamBody.Close()
 		cancel()
+		h.requestLogger.Log(reqNum, true, primaryModel, streamBuf.Bytes(), "resp")
 		latency := time.Since(streamStart)
 		h.metrics.RecordSuccess(model.ModelID, latency)
 		h.logger.Info("streaming completed", "model", model.ModelID, "latency", latency)
@@ -459,6 +484,8 @@ func (h *MessagesHandler) handleNonStreaming(
 	anthropicReq *types.MessageRequest,
 	modelChain []config.ModelConfig,
 	rawBody json.RawMessage,
+	reqNum int,
+	primaryModel string,
 ) {
 	ctx := r.Context()
 	startTime := time.Now()
@@ -472,7 +499,7 @@ func (h *MessagesHandler) handleNonStreaming(
 				return h.executeAnthropicRequest(ctx, rawBody, model)
 			}
 			// Otherwise use OpenAI transformation
-			return h.executeOpenAIRequest(ctx, anthropicReq, model)
+			return h.executeOpenAIRequest(ctx, anthropicReq, model, reqNum, primaryModel)
 		},
 	)
 
@@ -525,6 +552,8 @@ func (h *MessagesHandler) executeOpenAIRequest(
 	ctx context.Context,
 	anthropicReq *types.MessageRequest,
 	model config.ModelConfig,
+	reqNum int,
+	primaryModel string,
 ) ([]byte, error) {
 	// Transform request to OpenAI format.
 	openaiReq, err := h.requestTransformer.TransformRequest(anthropicReq, model)
@@ -532,11 +561,19 @@ func (h *MessagesHandler) executeOpenAIRequest(
 		return nil, fmt.Errorf("request transform failed: %w", err)
 	}
 
+	// Write outgoing OpenAI request body to file
+	reqJSON, _ := json.Marshal(openaiReq)
+	h.requestLogger.Log(reqNum, false, primaryModel, reqJSON, "req")
+
 	// Handle non-streaming.
 	resp, err := h.client.ChatCompletionNonStreaming(ctx, model.ModelID, openaiReq)
 	if err != nil {
 		return nil, fmt.Errorf("chat completion failed: %w", err)
 	}
+
+	// Write raw OpenAI response body to file
+	respJSON, _ := json.Marshal(resp)
+	h.requestLogger.Log(reqNum, false, primaryModel, respJSON, "resp")
 
 	// Transform response to Anthropic format.
 	anthropicResp, err := h.responseTransformer.TransformResponse(resp, model.ModelID)
@@ -544,7 +581,11 @@ func (h *MessagesHandler) executeOpenAIRequest(
 		return nil, fmt.Errorf("response transform failed: %w", err)
 	}
 
-	return json.Marshal(anthropicResp)
+	// Write final Anthropic-format response to file
+	anthropicJSON, _ := json.Marshal(anthropicResp)
+	h.requestLogger.Log(reqNum, false, primaryModel, anthropicJSON, "transformed")
+
+	return anthropicJSON, nil
 }
 
 // extractTextFromBlocks extracts plain text from Anthropic content blocks.

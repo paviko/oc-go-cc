@@ -675,24 +675,27 @@ func (h *MessagesHandler) handleStreaming(
 			continue
 		}
 
-		// Proxy the stream: transform OpenAI SSE → Anthropic SSE in real-time
-		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx, tokenCount, h.tokenCounter.CountTokens); err != nil {
-			_ = streamBody.Close()
+		// Proxy the stream: transform OpenAI SSE → Anthropic SSE in real-time.
+		// Tee the upstream body to capture the raw OpenAI streaming chunks.
+		var rawOpenAIBuf bytes.Buffer
+		proxyErr := h.streamHandler.ProxyStream(rw, io.NopCloser(io.TeeReader(streamBody, &rawOpenAIBuf)), model.ModelID, clientCtx, tokenCount, h.tokenCounter.CountTokens)
+		_ = streamBody.Close()
+		h.requestLogger.Log(reqNum, true, primaryModel, rawOpenAIBuf.Bytes(), "openai_resp")
+
+		if proxyErr != nil {
 			cancel()
-			if err == transformer.ErrClientDisconnected {
+			if proxyErr == transformer.ErrClientDisconnected {
 				h.logger.Info("client disconnected during stream")
 				return
 			}
-			// Check if this was a client disconnect
 			if clientCtx.Err() == context.Canceled {
 				h.logger.Info("client disconnected during stream (context canceled)")
 				return
 			}
-			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", err)
+			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", proxyErr)
 			continue
 		}
 
-		_ = streamBody.Close()
 		cancel()
 		h.requestLogger.Log(reqNum, true, primaryModel, streamBuf.Bytes(), "resp")
 		if cached := parseSSEToMessageResponse(streamBuf.Bytes()); cached != nil {

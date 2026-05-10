@@ -87,11 +87,25 @@ type Choice struct {
 
 // UsageInfo represents token usage information.
 type UsageInfo struct {
-	PromptTokens          int `json:"prompt_tokens"`
-	CompletionTokens      int `json:"completion_tokens"`
-	TotalTokens           int `json:"total_tokens"`
-	PromptCacheHitTokens  int `json:"prompt_cache_hit_tokens,omitempty"`
-	PromptCacheMissTokens int `json:"prompt_cache_miss_tokens,omitempty"`
+	PromptTokens             int                      `json:"prompt_tokens"`
+	CompletionTokens         int                      `json:"completion_tokens"`
+	TotalTokens              int                      `json:"total_tokens"`
+	PromptCacheHitTokens     int                      `json:"prompt_cache_hit_tokens,omitempty"`
+	PromptCacheMissTokens    int                      `json:"prompt_cache_miss_tokens,omitempty"`
+	CompletionTokensDetails  *CompletionTokensDetails `json:"completion_tokens_details,omitempty"`
+}
+
+// CompletionTokensDetails holds the breakdown of completion tokens.
+type CompletionTokensDetails struct {
+	ReasoningTokens int `json:"reasoning_tokens"`
+}
+
+// ReasoningTokens returns the reasoning token count, or 0 if details are not present.
+func (u *UsageInfo) ReasoningTokens() int {
+	if u == nil || u.CompletionTokensDetails == nil {
+		return 0
+	}
+	return u.CompletionTokensDetails.ReasoningTokens
 }
 
 // ChatCompletionChunk represents a streaming chunk from the Chat Completions API.

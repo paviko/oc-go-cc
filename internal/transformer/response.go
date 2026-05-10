@@ -65,7 +65,7 @@ func (t *ResponseTransformer) TransformResponse(
 			// inflated input_tokens on every turn and trips auto-compact ~5x
 			// too early on long-prefix sessions.
 			InputTokens:              nonNegative(openaiResp.Usage.PromptTokens - openaiResp.Usage.PromptCacheHitTokens - openaiResp.Usage.PromptCacheMissTokens),
-			OutputTokens:             openaiResp.Usage.CompletionTokens,
+			OutputTokens:             openaiResp.Usage.CompletionTokens + openaiResp.Usage.ReasoningTokens(),
 			CacheCreationInputTokens: openaiResp.Usage.PromptCacheMissTokens,
 			CacheReadInputTokens:     openaiResp.Usage.PromptCacheHitTokens,
 		},

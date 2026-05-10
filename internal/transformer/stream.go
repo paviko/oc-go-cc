@@ -659,7 +659,7 @@ func usageInfoToAnthropic(usage *types.UsageInfo) *types.Usage {
 		// for the same reason TransformResponse does — see the longer comment
 		// in response.go.
 		InputTokens:              nonNegative(usage.PromptTokens - usage.PromptCacheHitTokens - usage.PromptCacheMissTokens),
-		OutputTokens:             usage.CompletionTokens,
+		OutputTokens:             usage.CompletionTokens + usage.ReasoningTokens(),
 		CacheCreationInputTokens: usage.PromptCacheMissTokens,
 		CacheReadInputTokens:     usage.PromptCacheHitTokens,
 	}

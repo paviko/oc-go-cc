@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -43,15 +44,22 @@ func newStreamResponseCache() *streamResponseCache {
 }
 
 // getOrCreate returns an existing cache entry or creates a new one.
-// If the entry already exists and is complete, returns (response, true, true).
-// If the entry is still pending, waits for it and returns (response, true, false).
-// If no entry exists, creates one and returns (nil, false, false).
+// If the entry already exists and is complete, waits for it and returns (response, true).
+// If no entry exists, creates one and returns (nil, false).
+// If the entry exists but its first requester was cancelled (response is nil),
+// the entry is cleaned up and (nil, false) is returned so the caller proceeds normally.
 func (c *streamResponseCache) getOrCreate(key string) ([]byte, bool) {
 	c.mu.Lock()
 	entry, exists := c.entries[key]
 	if exists {
 		c.mu.Unlock()
 		<-entry.done
+		if entry.response == nil {
+			c.mu.Lock()
+			delete(c.entries, key)
+			c.mu.Unlock()
+			return nil, false
+		}
 		return entry.response, true
 	}
 	entry = &cacheEntry{done: make(chan struct{})}
@@ -69,7 +77,12 @@ func (c *streamResponseCache) store(key string, response []byte, ttl time.Durati
 		return
 	}
 	entry.response = response
-	close(entry.done)
+	select {
+	case <-entry.done:
+		// Already closed (cancelled), don't close again
+	default:
+		close(entry.done)
+	}
 
 	// Schedule cleanup after ttl
 	go func() {
@@ -78,6 +91,21 @@ func (c *streamResponseCache) store(key string, response []byte, ttl time.Durati
 		delete(c.entries, key)
 		c.mu.Unlock()
 	}()
+	c.mu.Unlock()
+}
+
+// cancel closes the done channel for a cache entry, signalling waiters
+// that the first request failed so they should proceed normally.
+// No TTL cleanup is scheduled here; the entry will be cleaned up by
+// the next getOrCreate (which resets done) or a subsequent store().
+func (c *streamResponseCache) cancel(key string) {
+	c.mu.Lock()
+	entry, exists := c.entries[key]
+	if !exists {
+		c.mu.Unlock()
+		return
+	}
+	close(entry.done)
 	c.mu.Unlock()
 }
 
@@ -607,6 +635,7 @@ func (h *MessagesHandler) handleStreaming(
 		select {
 		case <-clientCtx.Done():
 			h.logger.Info("client disconnected, stopping streaming fallbacks")
+			h.responseCache.cancel(cacheKey)
 			return
 		default:
 		}
@@ -625,8 +654,9 @@ func (h *MessagesHandler) handleStreaming(
 			if err := h.handleAnthropicStreaming(ctx, rw, modelBody, model.ModelID); err != nil {
 				cancel()
 				// Check if this was a client disconnect
-				if clientCtx.Err() == context.Canceled {
-					h.logger.Info("client disconnected during anthropic stream")
+				if clientCtx.Err() != nil {
+					h.logger.Info("client disconnected during anthropic stream", "err", clientCtx.Err())
+					h.responseCache.cancel(cacheKey)
 					return
 				}
 				h.logger.Warn("anthropic streaming failed", "model", model.ModelID, "error", err)
@@ -666,9 +696,10 @@ func (h *MessagesHandler) handleStreaming(
 		streamBody, err := h.client.GetStreamingBody(ctx, model.ModelID, openaiReq)
 		if err != nil {
 			cancel()
-			// Check if this was a client disconnect (context canceled)
-			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during upstream request")
+			// Check if this was a client disconnect
+			if clientCtx.Err() != nil {
+				h.logger.Info("client disconnected during upstream request", "err", clientCtx.Err())
+				h.responseCache.cancel(cacheKey)
 				return
 			}
 			h.logger.Warn("streaming request failed", "model", model.ModelID, "error", err)
@@ -684,12 +715,14 @@ func (h *MessagesHandler) handleStreaming(
 
 		if proxyErr != nil {
 			cancel()
-			if proxyErr == transformer.ErrClientDisconnected {
-				h.logger.Info("client disconnected during stream")
+			if errors.Is(proxyErr, transformer.ErrClientDisconnected) {
+				h.logger.Info("client disconnected during stream", "err", clientCtx.Err(), "proxy_err", proxyErr)
+				h.responseCache.cancel(cacheKey)
 				return
 			}
-			if clientCtx.Err() == context.Canceled {
-				h.logger.Info("client disconnected during stream (context canceled)")
+			if clientCtx.Err() != nil {
+				h.logger.Info("client disconnected during stream (context error)", "err", clientCtx.Err())
+				h.responseCache.cancel(cacheKey)
 				return
 			}
 			h.logger.Warn("stream proxy failed", "model", model.ModelID, "error", proxyErr)
@@ -712,6 +745,7 @@ func (h *MessagesHandler) handleStreaming(
 
 	// All models failed
 	h.metrics.RecordFailure()
+	h.responseCache.cancel(cacheKey)
 	if !rw.wroteHeader {
 		h.sendError(w, http.StatusBadGateway, "all streaming models failed", nil)
 	} else {
@@ -833,6 +867,7 @@ func (h *MessagesHandler) handleNonStreaming(
 
 	if err != nil {
 		h.metrics.RecordFailure()
+		h.responseCache.cancel(cacheKey)
 		h.sendError(w, http.StatusBadGateway, "all models failed", err)
 		return
 	}

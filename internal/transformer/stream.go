@@ -674,7 +674,10 @@ func writeSSEEvent(w http.ResponseWriter, event types.MessageEvent) error {
 	}
 
 	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Type, string(data))
-	return err
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrClientDisconnected, err)
+	}
+	return nil
 }
 
 // generateID creates a unique identifier based on current time.

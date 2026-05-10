@@ -327,7 +327,7 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 
 	if isStreaming {
 		// Streaming: use ProxyStream for real-time SSE transformation
-		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel, cacheKey)
+		h.handleStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel, cacheKey, tokenCount)
 	} else {
 		// Non-streaming: execute with fallback and return full response
 		h.handleNonStreaming(w, r, &anthropicReq, modelChain, rawBody, reqNum, primaryModel, cacheKey)
@@ -388,6 +388,42 @@ func stripBillingCCH(sys any) any {
 		return result
 	}
 	return sys
+}
+
+// countOutputTokensFromBlocks sums the token count of all text in content blocks.
+func (h *MessagesHandler) countOutputTokensFromBlocks(blocks []types.ContentBlock) int {
+	var allText strings.Builder
+	for _, block := range blocks {
+		switch block.Type {
+		case "text":
+			allText.WriteString(block.Text)
+		case "thinking":
+			allText.WriteString(block.Thinking)
+		case "tool_use":
+			allText.WriteString(block.Name)
+			allText.WriteString(string(block.Input))
+		}
+	}
+	text := allText.String()
+	if text == "" {
+		return 0
+	}
+	count, err := h.tokenCounter.CountTokens(text)
+	if err != nil {
+		return 0
+	}
+	return count
+}
+
+// injectUsageIfMissing sets input and output tokens on a cached response when the
+// upstream streaming didn't include usage (e.g. DeepSeek doesn't send usage in
+// streaming chunks even with include_usage=true).
+func (h *MessagesHandler) injectUsageIfMissing(cached *types.MessageResponse, inputTokens int) {
+	if cached.Usage.InputTokens != 0 || cached.Usage.OutputTokens != 0 {
+		return
+	}
+	cached.Usage.InputTokens = inputTokens
+	cached.Usage.OutputTokens = h.countOutputTokensFromBlocks(cached.Content)
 }
 
 // parseSSEToMessageResponse extracts a non-streaming MessageResponse from the
@@ -516,6 +552,7 @@ func (h *MessagesHandler) handleStreaming(
 	reqNum int,
 	primaryModel string,
 	cacheKey string,
+	tokenCount int,
 ) {
 	// Each fallback attempt needs its own context with timeout.
 	// Don't share r.Context() across fallbacks - when Claude Code retries,
@@ -597,6 +634,7 @@ func (h *MessagesHandler) handleStreaming(
 			cancel()
 			h.requestLogger.Log(reqNum, true, primaryModel, streamBuf.Bytes(), "resp")
 			if cached := parseSSEToMessageResponse(streamBuf.Bytes()); cached != nil {
+				h.injectUsageIfMissing(cached, tokenCount)
 				if cachedJSON, err := json.Marshal(cached); err == nil {
 					h.responseCache.store(cacheKey, cachedJSON, 5*time.Second)
 				}
@@ -657,6 +695,7 @@ func (h *MessagesHandler) handleStreaming(
 		cancel()
 		h.requestLogger.Log(reqNum, true, primaryModel, streamBuf.Bytes(), "resp")
 		if cached := parseSSEToMessageResponse(streamBuf.Bytes()); cached != nil {
+			h.injectUsageIfMissing(cached, tokenCount)
 			if cachedJSON, err := json.Marshal(cached); err == nil {
 				h.responseCache.store(cacheKey, cachedJSON, 5*time.Second)
 			}

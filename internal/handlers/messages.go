@@ -614,6 +614,9 @@ func (h *MessagesHandler) handleStreaming(
 			h.logger.Warn("request transform failed", "model", model.ModelID, "error", err)
 			continue
 		}
+		h.logger.Info("thinking transform",
+			append([]any{"model", model.ModelID}, thinkingLogAttrs(anthropicReq, openaiReq, model)...)...,
+		)
 
 		// Write outgoing OpenAI streaming request body to file
 		if reqJSON, err := json.Marshal(openaiReq); err == nil {
@@ -845,6 +848,9 @@ func (h *MessagesHandler) executeOpenAIRequest(
 	if err != nil {
 		return nil, fmt.Errorf("request transform failed: %w", err)
 	}
+	h.logger.Info("thinking transform",
+		append([]any{"model", model.ModelID}, thinkingLogAttrs(anthropicReq, openaiReq, model)...)...,
+	)
 
 	// Write outgoing OpenAI request body to file
 	reqJSON, _ := json.Marshal(openaiReq)
@@ -912,4 +918,59 @@ func (h *MessagesHandler) sendError(w http.ResponseWriter, statusCode int, messa
 
 	errorResp := transformer.TransformErrorResponse(statusCode, message)
 	_ = json.NewEncoder(w).Encode(errorResp)
+}
+
+func thinkingLogAttrs(anthropicReq *types.MessageRequest, openaiReq *types.ChatCompletionRequest, model config.ModelConfig) []any {
+	anthroType := "not_set"
+	var anthroBudgetTokens int
+	if len(anthropicReq.Thinking) > 0 {
+		var m struct {
+			Type         string `json:"type"`
+			BudgetTokens int    `json:"budget_tokens"`
+		}
+		if json.Unmarshal(anthropicReq.Thinking, &m) == nil {
+			anthroType = m.Type
+			anthroBudgetTokens = m.BudgetTokens
+		}
+	}
+
+	openaiThinkingType := "not_set"
+	if len(openaiReq.Thinking) > 0 {
+		var m struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(openaiReq.Thinking, &m) == nil {
+			openaiThinkingType = m.Type
+		}
+	}
+
+	reasoningEffort := "not_set"
+	if openaiReq.ReasoningEffort != nil {
+		reasoningEffort = *openaiReq.ReasoningEffort
+	}
+
+	configThinkingType := "not_set"
+	if len(model.Thinking) > 0 {
+		var m struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(model.Thinking, &m) == nil {
+			configThinkingType = m.Type
+		}
+	}
+
+	anthroEffort := "not_set"
+	if anthropicReq.OutputConfig != nil && anthropicReq.OutputConfig.Effort != "" {
+		anthroEffort = anthropicReq.OutputConfig.Effort
+	}
+
+	return []any{
+		"anthro_thinking", anthroType,
+		"anthro_budget_tokens", anthroBudgetTokens,
+		"anthro_effort", anthroEffort,
+		"config_thinking", configThinkingType,
+		"openai_thinking", openaiThinkingType,
+		"reasoning_effort", reasoningEffort,
+		"has_thinking_history", transformer.HasThinkingBlocks(anthropicReq.Messages),
+	}
 }

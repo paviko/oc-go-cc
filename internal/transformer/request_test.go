@@ -726,6 +726,9 @@ func TestAnthropicThinkingToOpenAIThinking(t *testing.T) {
 		{"disabled", `{"type":"disabled","budget_tokens":1000}`, `{"type":"disabled"}`},
 		{"enabled", `{"type":"enabled","budget_tokens":32000}`, `{"type":"enabled"}`},
 		{"enabled no budget", `{"type":"enabled"}`, `{"type":"enabled"}`},
+		{"adaptive no budget", `{"type":"adaptive"}`, `{"type":"enabled"}`},
+		{"adaptive budget zero", `{"type":"adaptive","budget_tokens":0}`, `{"type":"enabled"}`},
+		{"adaptive with budget", `{"type":"adaptive","budget_tokens":8000}`, `{"type":"enabled"}`},
 		{"invalid json", `not json`, ""},
 	}
 	for _, tt := range tests {
@@ -841,6 +844,181 @@ func TestTransformRequestSkipsReasoningEffortWhenConfigThinkingDisabled(t *testi
 	}
 	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
 		t.Fatalf("Thinking = %s, want %s", got, want)
+	}
+}
+
+func TestTransformRequestDefaultsThinkingDisabled(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{ModelID: "deepseek-v4-pro"})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want disabled when nothing enables it", got)
+	}
+	if openaiReq.ReasoningEffort != nil {
+		t.Fatalf("ReasoningEffort = %q, want nil", *openaiReq.ReasoningEffort)
+	}
+}
+
+func TestTransformRequestAdaptiveThinkingMapsToEnabled(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// adaptive type (CC's "low"/"medium"/"high") always maps to thinking=enabled.
+	// The effort level comes from output_config.effort, not budget_tokens.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Thinking:  json.RawMessage(`{"type":"adaptive"}`),
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if got, want := string(openaiReq.Thinking), `{"type":"enabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want enabled for adaptive", got)
+	}
+	// No reasoning_effort without output_config.effort or config
+	if openaiReq.ReasoningEffort != nil {
+		t.Fatalf("ReasoningEffort = %q, want nil (no effort source)", *openaiReq.ReasoningEffort)
+	}
+}
+
+func TestTransformRequestOutputConfigEffortMapsToReasoningEffort(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// CC effort level from output_config.effort maps to reasoning_effort.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Thinking:  json.RawMessage(`{"type":"adaptive"}`),
+		OutputConfig: &types.OutputConfig{
+			Effort: "medium",
+		},
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if got, want := string(openaiReq.Thinking), `{"type":"enabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want enabled", got)
+	}
+	if openaiReq.ReasoningEffort == nil {
+		t.Fatal("ReasoningEffort = nil, want medium from output_config.effort")
+	}
+	if got, want := *openaiReq.ReasoningEffort, "medium"; got != want {
+		t.Fatalf("ReasoningEffort = %q, want medium", got)
+	}
+}
+
+func TestTransformRequestSkipsReasoningEffortWhenThinkingNotSet(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	req := &types.MessageRequest{
+		Model:        "claude-test",
+		MaxTokens:    256,
+		OutputConfig: &types.OutputConfig{Effort: "medium"},
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want disabled (nothing enables it)", got)
+	}
+	if openaiReq.ReasoningEffort != nil {
+		t.Fatalf("ReasoningEffort = %q, want nil (thinking disabled)", *openaiReq.ReasoningEffort)
+	}
+}
+
+func TestTransformRequestSkipsReasoningEffortWhenThinkingDisabled(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	req := &types.MessageRequest{
+		Model:        "claude-test",
+		MaxTokens:    256,
+		Thinking:     json.RawMessage(`{"type":"disabled"}`),
+		OutputConfig: &types.OutputConfig{Effort: "medium"},
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want disabled", got)
+	}
+	if openaiReq.ReasoningEffort != nil {
+		t.Fatalf("ReasoningEffort = %q, want nil (thinking disabled)", *openaiReq.ReasoningEffort)
+	}
+}
+
+func TestTransformRequestAdaptiveThinkingWithBudgetMapsToEnabled(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// CC "medium"/"high" setting: adaptive with budget > 0
+	// should map to thinking=enabled with reasoning_effort derived.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Thinking:  json.RawMessage(`{"type":"adaptive","budget_tokens":8000}`),
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "deepseek-v4-pro",
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if got, want := string(openaiReq.Thinking), `{"type":"enabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want enabled for adaptive with budget", got)
+	}
+	if openaiReq.ReasoningEffort == nil {
+		t.Fatal("ReasoningEffort = nil, want medium (derived from budget_tokens=8000)")
+	}
+	if got, want := *openaiReq.ReasoningEffort, "medium"; got != want {
+		t.Fatalf("ReasoningEffort = %q, want medium", got)
 	}
 }
 

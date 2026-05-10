@@ -58,12 +58,15 @@ func anthropicThinkingToReasoningEffort(thinking json.RawMessage) string {
 
 // anthropicThinkingToOpenAIThinking maps Anthropic's thinking config to the
 // OpenAI/DeepSeek thinking format ({"type":"enabled"} or {"type":"disabled"}).
+// "adaptive" with no budget or budget=0 means the model should think minimally,
+// which maps to disabled on the OpenAI side.
 func anthropicThinkingToOpenAIThinking(thinking json.RawMessage) json.RawMessage {
 	if len(thinking) == 0 {
 		return nil
 	}
 	var m struct {
-		Type string `json:"type"`
+		Type         string `json:"type"`
+		BudgetTokens *int   `json:"budget_tokens"`
 	}
 	if err := json.Unmarshal(thinking, &m); err != nil {
 		return nil
@@ -71,7 +74,10 @@ func anthropicThinkingToOpenAIThinking(thinking json.RawMessage) json.RawMessage
 	if m.Type == "disabled" {
 		return json.RawMessage(`{"type":"disabled"}`)
 	}
-	return json.RawMessage(`{"type":"enabled"}`)
+	if m.Type == "enabled" || m.Type == "adaptive" {
+		return json.RawMessage(`{"type":"enabled"}`)
+	}
+	return nil
 }
 
 // isThinkingDisabled returns true when the OpenAI/DeepSeek thinking field
@@ -92,6 +98,17 @@ func isThinkingDisabled(thinking json.RawMessage) bool {
 // isDeepSeekModel returns true for DeepSeek models that require thinking mode handling.
 func isDeepSeekModel(modelID string) bool {
 	return strings.HasPrefix(modelID, "deepseek-")
+}
+
+// effortToReasoningEffort maps Claude Code's output_config.effort to an
+// OpenAI reasoning_effort value. Returns empty string if unknown.
+func effortToReasoningEffort(effort string) string {
+	switch effort {
+	case "low", "medium", "high":
+		return effort
+	default:
+		return ""
+	}
 }
 
 // needsPlaceholderReasoning returns true for providers whose validators require
@@ -145,35 +162,34 @@ func (t *RequestTransformer) TransformRequest(
 		openaiReq.MaxTokens = &maxTokens
 	}
 
-	// reasoning_effort: config takes priority, then derive from incoming Anthropic thinking.
-	// Never set when config explicitly disables thinking (DeepSeek rejects the combination).
-	if !isThinkingDisabled(model.Thinking) {
-		if model.ReasoningEffort != "" {
-			openaiReq.ReasoningEffort = &model.ReasoningEffort
-		} else if effort := anthropicThinkingToReasoningEffort(anthropicReq.Thinking); effort != "" {
-			openaiReq.ReasoningEffort = &effort
-		}
-	}
-
-	// thinking (DeepSeek format): config takes priority, then derive from Anthropic thinking.
-	// Never set thinking=disabled when reasoning_effort is already set, as
-	// providers (DeepSeek) reject the combination.
+	// thinking: config takes priority, then derive from history, then from incoming request.
+	// thinking is the gate for reasoning_effort — only when thinking=enabled do we set effort.
 	hasThinkingInHistory := HasThinkingBlocks(anthropicReq.Messages)
 	if len(model.Thinking) > 0 {
 		openaiReq.Thinking = model.Thinking
 	} else if hasThinkingInHistory {
 		if len(anthropicReq.Thinking) > 0 {
-			thinking := anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
-			if !isThinkingDisabled(thinking) || openaiReq.ReasoningEffort == nil {
-				openaiReq.Thinking = thinking
-			}
+			openaiReq.Thinking = anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
 		} else {
 			openaiReq.Thinking = json.RawMessage(`{"type":"enabled"}`)
 		}
 	} else if len(anthropicReq.Thinking) > 0 {
-		thinking := anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
-		if !isThinkingDisabled(thinking) || openaiReq.ReasoningEffort == nil {
-			openaiReq.Thinking = thinking
+		openaiReq.Thinking = anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
+	} else {
+		openaiReq.Thinking = json.RawMessage(`{"type":"disabled"}`)
+	}
+
+	// reasoning_effort: only set when thinking is explicitly enabled.
+	// Config > budget_tokens > output_config.effort.
+	if openaiReq.Thinking != nil && !isThinkingDisabled(openaiReq.Thinking) {
+		if model.ReasoningEffort != "" {
+			openaiReq.ReasoningEffort = &model.ReasoningEffort
+		} else if effort := anthropicThinkingToReasoningEffort(anthropicReq.Thinking); effort != "" {
+			openaiReq.ReasoningEffort = &effort
+		} else if anthropicReq.OutputConfig != nil {
+			if effort := effortToReasoningEffort(anthropicReq.OutputConfig.Effort); effort != "" {
+				openaiReq.ReasoningEffort = &effort
+			}
 		}
 	}
 

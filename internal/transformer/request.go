@@ -104,7 +104,7 @@ func isDeepSeekModel(modelID string) bool {
 // OpenAI reasoning_effort value. Returns empty string if unknown.
 func effortToReasoningEffort(effort string) string {
 	switch effort {
-	case "low", "medium", "high":
+	case "low", "medium", "high", "xhigh", "max":
 		return effort
 	default:
 		return ""

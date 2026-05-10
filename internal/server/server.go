@@ -86,7 +86,7 @@ func NewServer(atomic *config.AtomicConfig, autoRoute bool) (*Server, error) {
 		Addr:         addr,
 		Handler:      mux,
 		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 5 * time.Minute,
+		WriteTimeout: time.Duration(cfg.OpenCodeGo.TimeoutMs) * time.Millisecond,
 		IdleTimeout:  120 * time.Second,
 	}
 

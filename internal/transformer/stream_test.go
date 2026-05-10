@@ -63,6 +63,9 @@ func parseSSEEvents(t *testing.T, raw string) []types.MessageEvent {
 	return events
 }
 
+// countTokensStub is a stub token counter that returns 0 for all calls.
+func countTokensStub(s string) (int, error) { return 0, nil }
+
 func TestProxyStream_ReasoningContentFastPath(t *testing.T) {
 	handler := NewStreamHandler()
 	w := newMockResponseWriter()
@@ -75,15 +78,15 @@ func TestProxyStream_ReasoningContentFastPath(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
 	events := parseSSEEvents(t, w.buf.String())
 
-	// Expected: message_start, content_block_start, 2x content_block_delta, content_block_stop, message_delta, message_stop
-	if len(events) != 7 {
-		t.Fatalf("expected 7 events, got %d: %+v", len(events), events)
+	// Expected: message_start, content_block_start, 2x content_block_delta, content_block_stop, message_delta(finish), message_delta(usage), message_stop
+	if len(events) != 8 {
+		t.Fatalf("expected 8 events, got %d: %+v", len(events), events)
 	}
 
 	if events[0].Type != "message_start" {
@@ -116,8 +119,11 @@ func TestProxyStream_ReasoningContentFastPath(t *testing.T) {
 	if events[5].Type != "message_delta" {
 		t.Errorf("event[5].Type = %q, want message_delta", events[5].Type)
 	}
-	if events[6].Type != "message_stop" {
-		t.Errorf("event[6].Type = %q, want message_stop", events[6].Type)
+	if events[6].Type != "message_delta" || events[6].Usage == nil {
+		t.Errorf("event[6] = %+v, want message_delta with injected usage", events[6])
+	}
+	if events[7].Type != "message_stop" {
+		t.Errorf("event[7].Type = %q, want message_stop", events[7].Type)
 	}
 }
 
@@ -134,16 +140,16 @@ func TestProxyStream_ReasoningThenText(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
 	events := parseSSEEvents(t, w.buf.String())
 
 	// Expected: message_start, content_block_start(thinking, idx=0), thinking_delta, content_block_stop(idx=0),
-	//           content_block_start(text, idx=1), text_delta x2, content_block_stop(idx=1), message_delta, message_stop
-	if len(events) != 10 {
-		t.Fatalf("expected 10 events, got %d: %+v", len(events), events)
+	//           content_block_start(text, idx=1), text_delta x2, content_block_stop(idx=1), message_delta(finish), message_delta(usage), message_stop
+	if len(events) != 11 {
+		t.Fatalf("expected 11 events, got %d: %+v", len(events), events)
 	}
 
 	// Verify indexes
@@ -187,15 +193,15 @@ func TestProxyStream_TextOnlyStillWorks(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
 	events := parseSSEEvents(t, w.buf.String())
 
-	// Expected: message_start, content_block_start, 2x content_block_delta, content_block_stop, message_delta, message_stop
-	if len(events) != 7 {
-		t.Fatalf("expected 7 events, got %d: %+v", len(events), events)
+	// Expected: message_start, content_block_start, 2x content_block_delta, content_block_stop, message_delta(finish), message_delta(usage), message_stop
+	if len(events) != 8 {
+		t.Fatalf("expected 8 events, got %d: %+v", len(events), events)
 	}
 
 	if events[1].Type != "content_block_start" || events[1].ContentBlock == nil || events[1].ContentBlock.Type != "text" {
@@ -221,7 +227,7 @@ func TestProxyStream_UsageOnlyChunk(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "deepseek-v4-pro", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "deepseek-v4-pro", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
@@ -267,7 +273,7 @@ func TestProxyStream_PartialCacheTokensStreaming(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "deepseek-v4-pro", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "deepseek-v4-pro", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
@@ -309,7 +315,7 @@ func TestProxyStream_NoDuplicateMessageDelta(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "deepseek-v4-pro", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "deepseek-v4-pro", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
@@ -355,15 +361,15 @@ func TestProxyStream_ReasoningJSONFallback(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
 	events := parseSSEEvents(t, w.buf.String())
 
-	// Expected: message_start, content_block_start, content_block_delta, content_block_stop, message_delta, message_stop
-	if len(events) != 6 {
-		t.Fatalf("expected 6 events, got %d: %+v", len(events), events)
+	// Expected: message_start, content_block_start, content_block_delta, content_block_stop, message_delta(finish), message_delta(usage), message_stop
+	if len(events) != 7 {
+		t.Fatalf("expected 7 events, got %d: %+v", len(events), events)
 	}
 
 	if events[1].Type != "content_block_start" || events[1].ContentBlock == nil || events[1].ContentBlock.Type != "thinking" {
@@ -389,15 +395,15 @@ func TestProxyStream_EmptyReasoningContentSkipped(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
 	events := parseSSEEvents(t, w.buf.String())
 
-	// Empty reasoning should be skipped; only one text chunk -> 6 events total
-	if len(events) != 6 {
-		t.Fatalf("expected 6 events, got %d: %+v", len(events), events)
+	// Empty reasoning skipped; one text chunk -> 7 events total (incl. injected usage delta)
+	if len(events) != 7 {
+		t.Fatalf("expected 7 events, got %d: %+v", len(events), events)
 	}
 
 	if events[1].Type != "content_block_start" || events[1].ContentBlock == nil || events[1].ContentBlock.Type != "text" {
@@ -423,7 +429,7 @@ func TestProxyStream_ReasoningAndContentInSameChunk(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
@@ -431,9 +437,9 @@ func TestProxyStream_ReasoningAndContentInSameChunk(t *testing.T) {
 
 	// message_start + thinking_start + thinking_delta + thinking_stop +
 	// text_start + text_delta("Hello") + text_delta(" world") + text_stop +
-	// message_delta + message_stop = 10
-	if len(events) != 10 {
-		t.Fatalf("expected 10 events, got %d: %+v", len(events), events)
+	// message_delta(finish) + message_delta(usage) + message_stop = 11
+	if len(events) != 11 {
+		t.Fatalf("expected 11 events, got %d: %+v", len(events), events)
 	}
 
 	// Block 0: thinking
@@ -491,7 +497,7 @@ func TestProxyStream_ReasoningBeforeContentFastPathRegression(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "deepseek-v4-flash", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "deepseek-v4-flash", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
@@ -499,9 +505,9 @@ func TestProxyStream_ReasoningBeforeContentFastPathRegression(t *testing.T) {
 
 	// message_start + thinking_start + thinking_delta + thinking_stop +
 	// text_start + text_delta("Hello") + text_delta(" world") + text_stop +
-	// message_delta + message_stop = 10
-	if len(events) != 10 {
-		t.Fatalf("expected 10 events, got %d: %+v", len(events), events)
+	// message_delta(finish) + message_delta(usage) + message_stop = 11
+	if len(events) != 11 {
+		t.Fatalf("expected 11 events, got %d: %+v", len(events), events)
 	}
 
 	// Block 0: thinking (must NOT be lost)
@@ -542,7 +548,7 @@ func TestProxyStream_ToolCallFinishReasonWithUsage(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
@@ -587,17 +593,16 @@ func TestProxyStream_SingleToolCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
 	events := parseSSEEvents(t, w.buf.String())
 
-	// Expected: message_start, tool_start(idx=1), 2x input_json_delta (3rd arg arrives
-	// with finish_reason in same chunk, fast path returns before processing delta),
-	// tool_stop(idx=1), message_delta, message_stop = 7
-	if len(events) != 7 {
-		t.Fatalf("expected 7 events, got %d: %+v", len(events), events)
+	// Expected: message_start, tool_start(idx=0), 2x input_json_delta,
+	// tool_stop(idx=0), message_delta(finish), message_delta(usage), message_stop = 8
+	if len(events) != 8 {
+		t.Fatalf("expected 8 events, got %d: %+v", len(events), events)
 	}
 
 	// Verify tool_use block start
@@ -630,15 +635,19 @@ func TestProxyStream_SingleToolCall(t *testing.T) {
 		t.Errorf("event[4].Type = %q, want content_block_stop", events[4].Type)
 	}
 
-	// Verify stop reason
+	// Verify stop reason (message_delta without usage from finish_reason fast path)
 	if events[5].Type != "message_delta" {
 		t.Errorf("event[5].Type = %q, want message_delta", events[5].Type)
 	}
 	if events[5].Delta == nil || events[5].Delta.StopReason != "end_turn" {
 		t.Errorf("event[5].Delta.StopReason = %q, want end_turn", events[5].Delta.StopReason)
 	}
-	if events[6].Type != "message_stop" {
-		t.Errorf("event[6].Type = %q, want message_stop", events[6].Type)
+	// Injected usage message_delta
+	if events[6].Type != "message_delta" || events[6].Usage == nil {
+		t.Errorf("event[6] = %+v, want message_delta with usage", events[6])
+	}
+	if events[7].Type != "message_stop" {
+		t.Errorf("event[7].Type = %q, want message_stop", events[7].Type)
 	}
 }
 
@@ -663,7 +672,7 @@ func TestProxyStream_MultipleParallelToolCalls(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
@@ -725,7 +734,7 @@ func TestProxyStream_ToolCallGhostChunk(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 
@@ -758,7 +767,7 @@ func TestProxyStream_MixedTextAndToolCall(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx); err != nil {
+	if err := handler.ProxyStream(w, body, "kimi-k2.6", ctx, 0, countTokensStub); err != nil {
 		t.Fatalf("ProxyStream error: %v", err)
 	}
 

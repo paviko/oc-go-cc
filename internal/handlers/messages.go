@@ -233,6 +233,7 @@ func (h *MessagesHandler) HandleMessages(w http.ResponseWriter, r *http.Request)
 		"messages", len(anthropicReq.Messages),
 		"tools", len(anthropicReq.Tools),
 		"max_tokens", anthropicReq.MaxTokens,
+		"timeout_ms", h.timeout.Milliseconds(),
 	)
 
 	// Build message content for routing and token counting.
@@ -675,7 +676,7 @@ func (h *MessagesHandler) handleStreaming(
 		}
 
 		// Proxy the stream: transform OpenAI SSE → Anthropic SSE in real-time
-		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx); err != nil {
+		if err := h.streamHandler.ProxyStream(rw, streamBody, model.ModelID, clientCtx, tokenCount, h.tokenCounter.CountTokens); err != nil {
 			_ = streamBody.Close()
 			cancel()
 			if err == transformer.ErrClientDisconnected {

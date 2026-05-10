@@ -33,6 +33,8 @@ func NewStreamHandler() *StreamHandler {
 // ProxyStream takes an OpenAI streaming response and writes Anthropic-format SSE to the writer.
 // It reads OpenAI ChatCompletionChunk SSE events and transforms them into Anthropic MessageEvent SSE events.
 // The clientCtx is used to detect client disconnection and abort early.
+// If the upstream doesn't include usage in its streaming chunks, inputTokens and the
+// accumulated output text are used to inject a message_delta with usage before message_stop.
 //
 // CRITICAL: This function reads directly from resp.Body without buffering to minimize latency.
 // Per deep research: "Don't use bufio.Scanner or bufio.Reader on the response body - it adds buffering"
@@ -41,6 +43,8 @@ func (h *StreamHandler) ProxyStream(
 	openaiResp io.ReadCloser,
 	originalModel string,
 	clientCtx context.Context,
+	inputTokens int,
+	countTokens func(string) (int, error),
 ) error {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -73,6 +77,8 @@ func (h *StreamHandler) ProxyStream(
 	contentStarted := false
 	reasoningStarted := false
 	stopSent := false
+	usageSent := false
+	var outputText strings.Builder
 	toolUseCount := 0
 	startedToolCalls := make(map[int]int) // maps OpenAI tool call index → Anthropic content block index
 
@@ -98,7 +104,7 @@ func (h *StreamHandler) ProxyStream(
 					lineBuf.Reset()
 
 					// Process complete line
-					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &toolUseCount, startedToolCalls, originalModel); err != nil {
+					if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &usageSent, &outputText, &toolUseCount, startedToolCalls, originalModel); err != nil {
 						return err
 					}
 				} else {
@@ -111,7 +117,7 @@ func (h *StreamHandler) ProxyStream(
 			// Process any remaining data in buffer
 			if lineBuf.Len() > 0 {
 				line := lineBuf.String()
-				if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &toolUseCount, startedToolCalls, originalModel); err != nil {
+				if err := h.processSSELine(w, flusher, line, &contentIndex, &contentStarted, &reasoningStarted, &stopSent, &usageSent, &outputText, &toolUseCount, startedToolCalls, originalModel); err != nil {
 					return err
 				}
 			}
@@ -148,6 +154,58 @@ func (h *StreamHandler) ProxyStream(
 		}
 	}
 
+	// Close any open text or reasoning content block. The standard
+	// finish_reason path normally handles this, but if the upstream omitted
+	// finish_reason or emitted it in a separate chunk that wasn't parsed,
+	// we still need this block-stop so downstream parsers finalize the text.
+	if contentStarted || reasoningStarted {
+		stopEvent := types.MessageEvent{
+			Type:  "content_block_stop",
+			Index: &contentIndex,
+		}
+		if err := writeSSEEvent(w, stopEvent); err != nil {
+			return ErrClientDisconnected
+		}
+	}
+
+	// If the upstream didn't include usage in any chunk, inject it now.
+	if !usageSent {
+		outputTokens := 0
+		if outputText.Len() > 0 {
+			if n, err := countTokens(outputText.String()); err == nil {
+				outputTokens = n
+			}
+		}
+		usage := &types.Usage{
+			InputTokens:  inputTokens,
+			OutputTokens: outputTokens,
+		}
+		if !stopSent {
+			// No message_delta was sent at all — include stop_reason too.
+			msgDelta := types.MessageEvent{
+				Type: "message_delta",
+				Delta: &types.Delta{
+					StopReason: "end_turn",
+				},
+				Usage: usage,
+			}
+			if err := writeSSEEvent(w, msgDelta); err != nil {
+				return ErrClientDisconnected
+			}
+		} else {
+			// message_delta was sent without usage — send usage-only delta.
+			event := types.MessageEvent{
+				Type:  "message_delta",
+				Delta: &types.Delta{},
+				Usage: usage,
+			}
+			if err := writeSSEEvent(w, event); err != nil {
+				return ErrClientDisconnected
+			}
+		}
+		flusher.Flush()
+	}
+
 	// Send message_stop event to signal stream completion.
 	stopEvent := types.MessageEvent{
 		Type: "message_stop",
@@ -170,6 +228,8 @@ func (h *StreamHandler) processSSELine(
 	contentStarted *bool,
 	reasoningStarted *bool,
 	stopSent *bool,
+	usageSent *bool,
+	outputText *strings.Builder,
 	toolUseCount *int,
 	startedToolCalls map[int]int,
 	originalModel string,
@@ -210,6 +270,7 @@ func (h *StreamHandler) processSSELine(
 			if end != -1 {
 				content := data[start : start+end]
 				if content != "" {
+					outputText.WriteString(content)
 					if !*contentStarted {
 						// If reasoning was already started, close it first
 						if *reasoningStarted {
@@ -269,6 +330,8 @@ func (h *StreamHandler) processSSELine(
 			if err := writeSSEEvent(w, stopEvent); err != nil {
 				return ErrClientDisconnected
 			}
+			*contentStarted = false
+			*reasoningStarted = false
 		}
 
 		// Close any open tool_use blocks in ascending index order
@@ -324,6 +387,20 @@ func (h *StreamHandler) processSSELine(
 
 	if len(chunk.Choices) == 0 {
 		if chunk.Usage != nil {
+			*usageSent = true
+			// Close any open text or reasoning content block so the
+			// downstream parser finalizes it before seeing end-of-message markers.
+			if *contentStarted || *reasoningStarted {
+				stopEvent := types.MessageEvent{
+					Type:  "content_block_stop",
+					Index: contentIndex,
+				}
+				if err := writeSSEEvent(w, stopEvent); err != nil {
+					return ErrClientDisconnected
+				}
+				*contentStarted = false
+				*reasoningStarted = false
+			}
 			if *stopSent {
 				// Stop reason already sent — emit usage-only message_delta (no duplicate stop_reason).
 				event := types.MessageEvent{
@@ -349,6 +426,7 @@ func (h *StreamHandler) processSSELine(
 
 	// Handle reasoning content deltas
 	if choice.Delta.ReasoningContent != nil && *choice.Delta.ReasoningContent != "" {
+		outputText.WriteString(*choice.Delta.ReasoningContent)
 		if !*reasoningStarted {
 			// If text was already started, close it first
 			if *contentStarted {
@@ -390,6 +468,7 @@ func (h *StreamHandler) processSSELine(
 
 	// Handle text content deltas
 	if choice.Delta.Content != "" {
+		outputText.WriteString(choice.Delta.Content)
 		if !*contentStarted {
 			// If reasoning was already started, close it first
 			if *reasoningStarted {
@@ -501,6 +580,8 @@ func (h *StreamHandler) processSSELine(
 			if err := writeSSEEvent(w, stopEvent); err != nil {
 				return ErrClientDisconnected
 			}
+			*contentStarted = false
+			*reasoningStarted = false
 		}
 
 		// Close any open tool_use blocks in ascending index order.
@@ -544,6 +625,7 @@ func (h *StreamHandler) processSSELine(
 			return ErrClientDisconnected
 		}
 		*stopSent = true
+		*usageSent = true
 		flusher.Flush()
 	}
 

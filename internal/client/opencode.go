@@ -21,13 +21,11 @@ type OpenCodeClient struct {
 }
 
 // NewOpenCodeClient creates a new OpenCode Go client.
+// No Client.Timeout is set here — request deadlines are enforced per-request
+// via context (e.g., context.WithTimeout in MessagesHandler). This avoids a
+// second deadline wrapping the already-configured context deadline, which can
+// cause the client's internal timer to fire disruptively during long streams.
 func NewOpenCodeClient(atomic *config.AtomicConfig) *OpenCodeClient {
-	cfg := atomic.Get()
-	timeout := time.Duration(cfg.OpenCodeGo.TimeoutMs) * time.Millisecond
-	if timeout == 0 {
-		timeout = 5 * time.Minute
-	}
-
 	// Configure connection pooling for better performance
 	transport := &http.Transport{
 		MaxIdleConns:        100,
@@ -40,7 +38,6 @@ func NewOpenCodeClient(atomic *config.AtomicConfig) *OpenCodeClient {
 	return &OpenCodeClient{
 		atomic: atomic,
 		httpClient: &http.Client{
-			Timeout:   timeout,
 			Transport: transport,
 		},
 	}

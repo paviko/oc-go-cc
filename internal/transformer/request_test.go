@@ -206,9 +206,12 @@ func TestTransformRequestOmitsStreamUsageOptionsWhenStreamingDisabled(t *testing
 	}
 }
 
-func TestTransformRequestIncludesEmptyReasoningContentForToolCalls(t *testing.T) {
+func TestTransformRequestOmitsPlaceholderWhenThinkingInactive(t *testing.T) {
 	transformer := NewRequestTransformer()
 
+	// Without thinking history and without config thinking, tool-call-only
+	// messages should NOT get a placeholder — providers don't require
+	// reasoning_content when thinking mode is inactive.
 	req := &types.MessageRequest{
 		Model:     "claude-test",
 		MaxTokens: 256,
@@ -228,11 +231,8 @@ func TestTransformRequestIncludesEmptyReasoningContentForToolCalls(t *testing.T)
 	}
 
 	msg := openaiReq.Messages[0]
-	if msg.ReasoningContent == nil {
-		t.Fatal("ReasoningContent = nil, want non-nil placeholder")
-	}
-	if got, want := *msg.ReasoningContent, " "; got != want {
-		t.Fatalf("ReasoningContent = %q, want %q", got, want)
+	if msg.ReasoningContent != nil {
+		t.Fatalf("ReasoningContent = %q, want nil (no thinking history, no config thinking)", *msg.ReasoningContent)
 	}
 }
 
@@ -467,11 +467,11 @@ func TestTransformRequestPlacesToolResultsBeforeUserText(t *testing.T) {
 	}
 }
 
-func TestTransformRequestForwardsReasoningEffortEvenWhenThinkingDisabled(t *testing.T) {
+func TestTransformRequestOmitsReasoningEffortWhenThinkingDisabled(t *testing.T) {
 	transformer := NewRequestTransformer()
 
-	// reasoning_effort is always forwarded when config defines it, even when
-	// thinking is disabled in config.
+	// reasoning_effort is omitted when thinking is explicitly disabled in config,
+	// because providers (DeepSeek) reject the combination.
 	req := &types.MessageRequest{
 		Model:     "claude-test",
 		MaxTokens: 256,
@@ -496,11 +496,8 @@ func TestTransformRequestForwardsReasoningEffortEvenWhenThinkingDisabled(t *test
 		t.Fatalf("TransformRequest() error = %v", err)
 	}
 
-	if openaiReq.ReasoningEffort == nil {
-		t.Fatal("ReasoningEffort = nil, want max (config always forwarded)")
-	}
-	if got, want := *openaiReq.ReasoningEffort, "max"; got != want {
-		t.Fatalf("ReasoningEffort = %q, want %q", got, want)
+	if openaiReq.ReasoningEffort != nil {
+		t.Fatal("ReasoningEffort should be nil when thinking is disabled in config")
 	}
 	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
 		t.Fatalf("Thinking = %s, want %s", got, want)
@@ -590,6 +587,101 @@ func TestTransformRequestDeepSeekPlaceholderWithThinkingHistory(t *testing.T) {
 	}
 	if *toolCallAssistant.ReasoningContent != " " {
 		t.Fatalf("ReasoningContent = %q, want placeholder space", *toolCallAssistant.ReasoningContent)
+	}
+}
+
+func TestTransformRequestDeepSeekPlaceholderTextOnlyWithThinkingHistory(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// D3 fix: text-only assistant messages (no tool_calls, no thinking)
+	// should also get a placeholder when thinking history exists, because
+	// DeepSeek requires reasoning_content on ALL assistant messages in
+	// thinking mode.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"think about this"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"thinking","thinking":"Let me think..."},
+					{"type":"text","text":"I considered it"}
+				]`),
+			},
+			{Role: "user", Content: json.RawMessage(`"ok, what's next"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"text","text":"Next step is..."}
+				]`),
+			},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:         "deepseek-v4-flash",
+		ReasoningEffort: "high",
+		Thinking:        json.RawMessage(`{"type":"enabled"}`),
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	// Second assistant message is text-only, no tool_calls, no thinking
+	var textOnlyAssistant *types.ChatMessage
+	for i := len(openaiReq.Messages) - 1; i >= 0; i-- {
+		if openaiReq.Messages[i].Role == "assistant" && len(openaiReq.Messages[i].ToolCalls) == 0 {
+			textOnlyAssistant = &openaiReq.Messages[i]
+			break
+		}
+	}
+	if textOnlyAssistant == nil {
+		t.Fatal("no text-only assistant message found")
+	}
+	if textOnlyAssistant.ReasoningContent == nil {
+		t.Fatal("ReasoningContent = nil, want non-nil placeholder for DeepSeek text-only message with thinking history")
+	}
+	if *textOnlyAssistant.ReasoningContent != " " {
+		t.Fatalf("ReasoningContent = %q, want placeholder space", *textOnlyAssistant.ReasoningContent)
+	}
+}
+
+func TestTransformRequestDeepSeekPlaceholderWithConfigThinking(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// D4 fix: when config enforces thinking via thinking: enabled but the
+	// conversation history has no thinking blocks, tool-call assistant
+	// messages should still get a placeholder because the provider requires
+	// reasoning_content in thinking mode.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"tool_use","id":"toolu_789","name":"search","input":{"q":"test"}}
+				]`),
+			},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:  "deepseek-v4-flash",
+		Thinking: json.RawMessage(`{"type":"enabled"}`),
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	msg := openaiReq.Messages[1]
+	if msg.ReasoningContent == nil {
+		t.Fatal("ReasoningContent = nil, want non-nil placeholder for DeepSeek with config-enforced thinking")
+	}
+	if *msg.ReasoningContent != " " {
+		t.Fatalf("ReasoningContent = %q, want placeholder space", *msg.ReasoningContent)
 	}
 }
 
@@ -717,6 +809,38 @@ func TestTransformRequestConfigReasoningEffortOverridesAnthropicThinking(t *test
 	}
 	if got, want := *openaiReq.ReasoningEffort, "medium"; got != want {
 		t.Fatalf("ReasoningEffort = %q, want %q", got, want)
+	}
+}
+
+func TestTransformRequestSkipsReasoningEffortWhenConfigThinkingDisabled(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// When config has thinking=disabled, reasoning_effort must NOT be set
+	// from ANY source (config OR derived from incoming request), because
+	// DeepSeek rejects the combination.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Thinking:  json.RawMessage(`{"type":"enabled","budget_tokens":32000}`),
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:         "deepseek-v4-flash",
+		ReasoningEffort: "max",
+		Thinking:        json.RawMessage(`{"type":"disabled"}`),
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	if openaiReq.ReasoningEffort != nil {
+		t.Fatalf("ReasoningEffort = %q, want nil (config thinking is disabled, must block all sources)", *openaiReq.ReasoningEffort)
+	}
+	if got, want := string(openaiReq.Thinking), `{"type":"disabled"}`; got != want {
+		t.Fatalf("Thinking = %s, want %s", got, want)
 	}
 }
 

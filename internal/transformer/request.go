@@ -74,6 +74,21 @@ func anthropicThinkingToOpenAIThinking(thinking json.RawMessage) json.RawMessage
 	return json.RawMessage(`{"type":"enabled"}`)
 }
 
+// isThinkingDisabled returns true when the OpenAI/DeepSeek thinking field
+// is explicitly set to {"type":"disabled"}.
+func isThinkingDisabled(thinking json.RawMessage) bool {
+	if len(thinking) == 0 {
+		return false
+	}
+	var m struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(thinking, &m); err != nil {
+		return false
+	}
+	return m.Type == "disabled"
+}
+
 // isDeepSeekModel returns true for DeepSeek models that require thinking mode handling.
 func isDeepSeekModel(modelID string) bool {
 	return strings.HasPrefix(modelID, "deepseek-")
@@ -92,7 +107,7 @@ func (t *RequestTransformer) TransformRequest(
 	model config.ModelConfig,
 ) (*types.ChatCompletionRequest, error) {
 	// Transform messages
-	messages, err := t.transformMessages(anthropicReq, model.ModelID)
+	messages, err := t.transformMessages(anthropicReq, model)
 	if err != nil {
 		return nil, fmt.Errorf("failed to transform messages: %w", err)
 	}
@@ -131,24 +146,35 @@ func (t *RequestTransformer) TransformRequest(
 	}
 
 	// reasoning_effort: config takes priority, then derive from incoming Anthropic thinking.
-	if model.ReasoningEffort != "" {
-		openaiReq.ReasoningEffort = &model.ReasoningEffort
-	} else if effort := anthropicThinkingToReasoningEffort(anthropicReq.Thinking); effort != "" {
-		openaiReq.ReasoningEffort = &effort
+	// Never set when config explicitly disables thinking (DeepSeek rejects the combination).
+	if !isThinkingDisabled(model.Thinking) {
+		if model.ReasoningEffort != "" {
+			openaiReq.ReasoningEffort = &model.ReasoningEffort
+		} else if effort := anthropicThinkingToReasoningEffort(anthropicReq.Thinking); effort != "" {
+			openaiReq.ReasoningEffort = &effort
+		}
 	}
 
 	// thinking (DeepSeek format): config takes priority, then derive from Anthropic thinking.
+	// Never set thinking=disabled when reasoning_effort is already set, as
+	// providers (DeepSeek) reject the combination.
 	hasThinkingInHistory := HasThinkingBlocks(anthropicReq.Messages)
 	if len(model.Thinking) > 0 {
 		openaiReq.Thinking = model.Thinking
 	} else if hasThinkingInHistory {
 		if len(anthropicReq.Thinking) > 0 {
-			openaiReq.Thinking = anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
+			thinking := anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
+			if !isThinkingDisabled(thinking) || openaiReq.ReasoningEffort == nil {
+				openaiReq.Thinking = thinking
+			}
 		} else {
 			openaiReq.Thinking = json.RawMessage(`{"type":"enabled"}`)
 		}
 	} else if len(anthropicReq.Thinking) > 0 {
-		openaiReq.Thinking = anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
+		thinking := anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
+		if !isThinkingDisabled(thinking) || openaiReq.ReasoningEffort == nil {
+			openaiReq.Thinking = thinking
+		}
 	}
 
 	// Transform tools if present
@@ -176,8 +202,9 @@ func HasThinkingBlocks(messages []types.Message) bool {
 }
 
 // transformMessages converts Anthropic messages to OpenAI format.
-func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageRequest, modelID string) ([]types.ChatMessage, error) {
-	hasThinking := HasThinkingBlocks(anthropicReq.Messages)
+func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageRequest, model config.ModelConfig) ([]types.ChatMessage, error) {
+	hasThinking := HasThinkingBlocks(anthropicReq.Messages) ||
+		(len(model.Thinking) > 0 && !isThinkingDisabled(model.Thinking))
 
 	var result []types.ChatMessage
 
@@ -205,7 +232,7 @@ func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageReques
 
 	// Transform each message
 	for _, msg := range anthropicReq.Messages {
-		openaiMsgs, err := t.transformMessage(msg, modelID, hasThinking)
+		openaiMsgs, err := t.transformMessage(msg, model.ModelID, hasThinking)
 		if err != nil {
 			return nil, err
 		}
@@ -322,19 +349,11 @@ func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlo
 
 	var reasoningContentPtr *string
 	if reasoningContent != "" {
-		// Real thinking content from the upstream history — preserve it.
 		reasoningContentPtr = &reasoningContent
-	} else if hasThinkingInHistory && len(toolCalls) > 0 && isDeepSeekModel(modelID) {
-		// DeepSeek in thinking mode requires reasoning_content on ALL assistant
-		// messages, including tool-call turns where Claude Code didn't preserve
-		// the thinking block. Use a placeholder that won't trigger validation:
-		// DeepSeek checks for the field's presence, not its content, when the
-		// original thinking was stripped by the client.
+	} else if hasThinkingInHistory && isDeepSeekModel(modelID) {
 		placeholder := " "
 		reasoningContentPtr = &placeholder
-	} else if len(toolCalls) > 0 && needsPlaceholderReasoning(modelID) {
-		// Moonshot's validator treats an empty string as missing, so use a
-		// non-empty placeholder when we must provide the field.
+	} else if hasThinkingInHistory && len(toolCalls) > 0 && needsPlaceholderReasoning(modelID) {
 		placeholder := " "
 		reasoningContentPtr = &placeholder
 	}

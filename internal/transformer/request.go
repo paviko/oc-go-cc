@@ -219,8 +219,10 @@ func HasThinkingBlocks(messages []types.Message) bool {
 
 // transformMessages converts Anthropic messages to OpenAI format.
 func (t *RequestTransformer) transformMessages(anthropicReq *types.MessageRequest, model config.ModelConfig) ([]types.ChatMessage, error) {
+	reqThinking := anthropicThinkingToOpenAIThinking(anthropicReq.Thinking)
 	hasThinking := HasThinkingBlocks(anthropicReq.Messages) ||
-		(len(model.Thinking) > 0 && !isThinkingDisabled(model.Thinking))
+		(len(model.Thinking) > 0 && !isThinkingDisabled(model.Thinking)) ||
+		(len(reqThinking) > 0 && !isThinkingDisabled(reqThinking))
 
 	var result []types.ChatMessage
 
@@ -366,10 +368,7 @@ func (t *RequestTransformer) transformAssistantMessage(blocks []types.ContentBlo
 	var reasoningContentPtr *string
 	if reasoningContent != "" {
 		reasoningContentPtr = &reasoningContent
-	} else if hasThinkingInHistory && isDeepSeekModel(modelID) {
-		placeholder := " "
-		reasoningContentPtr = &placeholder
-	} else if hasThinkingInHistory && len(toolCalls) > 0 && needsPlaceholderReasoning(modelID) {
+	} else if hasThinkingInHistory && (isDeepSeekModel(modelID) || needsPlaceholderReasoning(modelID)) {
 		placeholder := " "
 		reasoningContentPtr = &placeholder
 	}

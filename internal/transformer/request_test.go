@@ -685,6 +685,195 @@ func TestTransformRequestDeepSeekPlaceholderWithConfigThinking(t *testing.T) {
 	}
 }
 
+func TestTransformRequestKimiPlaceholderWithThinkingHistory(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// When thinking history exists, Kimi assistant messages with tool_calls
+	// but no thinking block MUST get a placeholder reasoning_content, because
+	// Moonshot requires ALL assistant messages to have reasoning_content in
+	// thinking mode.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"think about this"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"thinking","thinking":"Let me think..."},
+					{"type":"text","text":"I considered it"}
+				]`),
+			},
+			{Role: "user", Content: json.RawMessage(`"now use a tool"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"tool_use","id":"toolu_789","name":"search","input":{"q":"test"}}
+				]`),
+			},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:         "kimi-k2.6",
+		ReasoningEffort: "high",
+		Thinking:        json.RawMessage(`{"type":"enabled"}`),
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	// Find the second assistant message (tool_call only, no thinking)
+	var toolCallAssistant *types.ChatMessage
+	for i := range openaiReq.Messages {
+		if openaiReq.Messages[i].Role == "assistant" && len(openaiReq.Messages[i].ToolCalls) > 0 {
+			toolCallAssistant = &openaiReq.Messages[i]
+			break
+		}
+	}
+	if toolCallAssistant == nil {
+		t.Fatal("no assistant message with tool_calls found")
+	}
+	if toolCallAssistant.ReasoningContent == nil {
+		t.Fatal("ReasoningContent = nil, want non-nil placeholder for Kimi with thinking history")
+	}
+	if *toolCallAssistant.ReasoningContent != " " {
+		t.Fatalf("ReasoningContent = %q, want placeholder space", *toolCallAssistant.ReasoningContent)
+	}
+}
+
+func TestTransformRequestKimiPlaceholderTextOnlyWithThinkingHistory(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// Text-only assistant messages (no tool_calls, no thinking) should also
+	// get a placeholder when thinking history exists, because Moonshot
+	// requires reasoning_content on ALL assistant messages in thinking mode.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"think about this"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"thinking","thinking":"Let me think..."},
+					{"type":"text","text":"I considered it"}
+				]`),
+			},
+			{Role: "user", Content: json.RawMessage(`"ok, what's next"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"text","text":"Next step is..."}
+				]`),
+			},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:         "kimi-k2.6",
+		ReasoningEffort: "high",
+		Thinking:        json.RawMessage(`{"type":"enabled"}`),
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	// Second assistant message is text-only, no tool_calls, no thinking
+	var textOnlyAssistant *types.ChatMessage
+	for i := len(openaiReq.Messages) - 1; i >= 0; i-- {
+		if openaiReq.Messages[i].Role == "assistant" && len(openaiReq.Messages[i].ToolCalls) == 0 {
+			textOnlyAssistant = &openaiReq.Messages[i]
+			break
+		}
+	}
+	if textOnlyAssistant == nil {
+		t.Fatal("no text-only assistant message found")
+	}
+	if textOnlyAssistant.ReasoningContent == nil {
+		t.Fatal("ReasoningContent = nil, want non-nil placeholder for Kimi text-only message with thinking history")
+	}
+	if *textOnlyAssistant.ReasoningContent != " " {
+		t.Fatalf("ReasoningContent = %q, want placeholder space", *textOnlyAssistant.ReasoningContent)
+	}
+}
+
+func TestTransformRequestKimiPlaceholderWithConfigThinking(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// When config enforces thinking via thinking: enabled but the
+	// conversation history has no thinking blocks, assistant
+	// messages should still get a placeholder because Moonshot requires
+	// reasoning_content in thinking mode.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"tool_use","id":"toolu_789","name":"search","input":{"q":"test"}}
+				]`),
+			},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID:  "kimi-k2.6",
+		Thinking: json.RawMessage(`{"type":"enabled"}`),
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	msg := openaiReq.Messages[1]
+	if msg.ReasoningContent == nil {
+		t.Fatal("ReasoningContent = nil, want non-nil placeholder for Kimi with config-enforced thinking")
+	}
+	if *msg.ReasoningContent != " " {
+		t.Fatalf("ReasoningContent = %q, want placeholder space", *msg.ReasoningContent)
+	}
+}
+
+func TestTransformRequestKimiPlaceholderWithRequestThinking(t *testing.T) {
+	transformer := NewRequestTransformer()
+
+	// When the incoming Anthropic request has thinking enabled but there is
+	// no model config thinking and no thinking history, assistant messages
+	// should still get a placeholder because the provider requires
+	// reasoning_content whenever thinking mode is active.
+	req := &types.MessageRequest{
+		Model:     "claude-test",
+		MaxTokens: 256,
+		Thinking:  json.RawMessage(`{"type":"enabled","budget_tokens":32000}`),
+		Messages: []types.Message{
+			{Role: "user", Content: json.RawMessage(`"hello"`)},
+			{
+				Role: "assistant",
+				Content: json.RawMessage(`[
+					{"type":"tool_use","id":"toolu_789","name":"search","input":{"q":"test"}}
+				]`),
+			},
+		},
+	}
+
+	openaiReq, err := transformer.TransformRequest(req, config.ModelConfig{
+		ModelID: "kimi-k2.6",
+	})
+	if err != nil {
+		t.Fatalf("TransformRequest() error = %v", err)
+	}
+
+	msg := openaiReq.Messages[1]
+	if msg.ReasoningContent == nil {
+		t.Fatal("ReasoningContent = nil, want non-nil placeholder for Kimi with request thinking enabled")
+	}
+	if *msg.ReasoningContent != " " {
+		t.Fatalf("ReasoningContent = %q, want placeholder space", *msg.ReasoningContent)
+	}
+}
+
 func TestAnthropicThinkingToReasoningEffort(t *testing.T) {
 	tests := []struct {
 		name     string
